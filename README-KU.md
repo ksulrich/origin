@@ -1,5 +1,9 @@
 # Setup 
 
+## Links
+
+* [How to customize OpenShift RBAC permissions](https://developers.redhat.com/blog/2017/12/04/customize-openshift-rbac-permissions/)
+
 ## Repo
 
 <https://github.com/openshift/origin>
@@ -40,6 +44,7 @@ oc project tiller
 export TILLER_NAMESPACE=tiller
 curl -s https://storage.googleapis.com/kubernetes-helm/helm-v2.9.0-linux-amd64.tar.gz | tar xz
 cd linux-amd64
+cp helm $HOME/bin/.
 ./helm init --client-only
 
 oc process -f https://github.com/openshift/origin/raw/master/examples/helm/tiller-template.yaml -p TILLER_NAMESPACE="${TILLER_NAMESPACE}" -p HELM_VERSION=v2.9.0 | oc create -f -
@@ -96,6 +101,5 @@ oc policy add-role-to-user edit "system:serviceaccount:${TILLER_NAMESPACE}:tille
 
 ~~~
 root@ku17rhel76 ~/github/cert-kubernetes
-scripts/loadimages.sh -p ~/DBAMC-18.0.2.tgz -r 172.30.1.1:5000/myproject
+scripts/loadimages.sh -p ~/DBAMC-18.0.2.tgz -r 172.30.1.1:5000
 ~~~
-scripts/loadimages.sh -p /Downloads/PPA/ImageArchive.tgz -r docker-registry.default.svc:5000/demo-project
