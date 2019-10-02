@@ -16,9 +16,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	e2e "k8s.io/kubernetes/test/e2e/framework"
 
+	"github.com/openshift/api/image/docker10"
+	imagev1 "github.com/openshift/api/image/v1"
 	"github.com/openshift/library-go/pkg/image/imageutil"
-	imageapi "github.com/openshift/origin/pkg/image/apis/image"
-	"github.com/openshift/origin/pkg/image/dockerlayer"
+
 	exutil "github.com/openshift/origin/test/extended/util"
 )
 
@@ -236,10 +237,12 @@ func testPruneImages(oc *exutil.CLI, schemaVersion int) {
 	o.Expect(pruneSize < keepSize).To(o.BeTrue())
 
 	g.By(fmt.Sprintf("ensure uploaded image is of schema %d", schemaVersion))
-	imgPrune, err := oc.AsAdmin().ImageClient().Image().Images().Get(imgPruneName, metav1.GetOptions{})
+	imgPrune, err := oc.AsAdmin().ImageClient().ImageV1().Images().Get(imgPruneName, metav1.GetOptions{})
 	o.Expect(err).NotTo(o.HaveOccurred())
+	o.Expect(err).NotTo(o.HaveOccurred())
+	err = imageutil.ImageWithMetadata(imgPrune)
 	o.Expect(imgPrune.DockerImageManifestMediaType).To(o.Equal(mediaType))
-	imgKeep, err := oc.AsAdmin().ImageClient().Image().Images().Get(imgKeepName, metav1.GetOptions{})
+	imgKeep, err := oc.AsAdmin().ImageClient().ImageV1().Images().Get(imgKeepName, metav1.GetOptions{})
 	o.Expect(err).NotTo(o.HaveOccurred())
 	o.Expect(imgKeep.DockerImageManifestMediaType).To(o.Equal(mediaType))
 
@@ -250,13 +253,14 @@ func testPruneImages(oc *exutil.CLI, schemaVersion int) {
 
 	g.By("verify images, layers and configs about to be pruned")
 	o.Expect(output).To(o.ContainSubstring(imgPruneName))
+	imageutil.ImageWithMetadataOrDie(imgPrune)
 	if schemaVersion == 1 {
-		o.Expect(output).NotTo(o.ContainSubstring(imgPrune.DockerImageMetadata.ID))
+		o.Expect(output).NotTo(o.ContainSubstring(imgPrune.DockerImageMetadata.Object.(*docker10.DockerImage).ID))
 	} else {
-		o.Expect(output).To(o.ContainSubstring(imgPrune.DockerImageMetadata.ID))
+		o.Expect(output).To(o.ContainSubstring(imgPrune.DockerImageMetadata.Object.(*docker10.DockerImage).ID))
 	}
 	for _, layer := range imgPrune.DockerImageLayers {
-		if layer.Name == dockerlayer.GzippedEmptyLayerDigest {
+		if layer.Name == GzippedEmptyLayerDigest {
 			// Schema 1 manifests are known to have the widespread layer.
 			continue
 		}
@@ -264,7 +268,8 @@ func testPruneImages(oc *exutil.CLI, schemaVersion int) {
 	}
 
 	o.Expect(output).NotTo(o.ContainSubstring(imgKeepName))
-	o.Expect(output).NotTo(o.ContainSubstring(imgKeep.DockerImageMetadata.ID))
+	imageutil.ImageWithMetadataOrDie(imgKeep)
+	o.Expect(output).NotTo(o.ContainSubstring(imgKeep.DockerImageMetadata.Object.(*docker10.DockerImage).ID))
 	for _, layer := range imgKeep.DockerImageLayers {
 		o.Expect(output).NotTo(o.ContainSubstring(layer.Name))
 	}
@@ -280,13 +285,14 @@ func testPruneImages(oc *exutil.CLI, schemaVersion int) {
 
 	g.By("verify images, layers and configs about to be pruned")
 	o.Expect(output).To(o.ContainSubstring(imgPruneName))
+	imageutil.ImageWithMetadataOrDie(imgPrune)
 	if schemaVersion == 1 {
-		o.Expect(output).NotTo(o.ContainSubstring(imgPrune.DockerImageMetadata.ID))
+		o.Expect(output).NotTo(o.ContainSubstring(imgPrune.DockerImageMetadata.Object.(*docker10.DockerImage).ID))
 	} else {
-		o.Expect(output).To(o.ContainSubstring(imgPrune.DockerImageMetadata.ID))
+		o.Expect(output).To(o.ContainSubstring(imgPrune.DockerImageMetadata.Object.(*docker10.DockerImage).ID))
 	}
 	for _, layer := range imgPrune.DockerImageLayers {
-		if layer.Name == dockerlayer.GzippedEmptyLayerDigest {
+		if layer.Name == GzippedEmptyLayerDigest {
 			// Schema 1 manifests are known to have the widespread layer.
 			continue
 		}
@@ -300,7 +306,7 @@ func testPruneImages(oc *exutil.CLI, schemaVersion int) {
 	}
 
 	o.Expect(output).NotTo(o.ContainSubstring(imgKeepName))
-	o.Expect(output).NotTo(o.ContainSubstring(imgKeep.DockerImageMetadata.ID))
+	o.Expect(output).NotTo(o.ContainSubstring(imgKeep.DockerImageMetadata.Object.(*docker10.DockerImage).ID))
 	for _, layer := range imgKeep.DockerImageLayers {
 		o.Expect(output).NotTo(o.ContainSubstring(layer.Name))
 
@@ -312,11 +318,13 @@ func testPruneImages(oc *exutil.CLI, schemaVersion int) {
 
 	confirmSize, err := GetRegistryStorageSize(oc)
 	o.Expect(err).NotTo(o.HaveOccurred())
-	g.By(fmt.Sprintf("confirming storage size: sizeOfKeepImage=%d <= sizeAfterPrune=%d < beforePruneSize=%d", imgKeep.DockerImageMetadata.Size, confirmSize, keepSize))
-	o.Expect(confirmSize >= imgKeep.DockerImageMetadata.Size).To(o.BeTrue())
+	err = imageutil.ImageWithMetadata(imgKeep)
+	o.Expect(err).NotTo(o.HaveOccurred())
+	g.By(fmt.Sprintf("confirming storage size: sizeOfKeepImage=%d <= sizeAfterPrune=%d < beforePruneSize=%d", imgKeep.DockerImageMetadata.Object.(*docker10.DockerImage).Size, confirmSize, keepSize))
+	o.Expect(confirmSize >= imgKeep.DockerImageMetadata.Object.(*docker10.DockerImage).Size).To(o.BeTrue())
 	o.Expect(confirmSize < keepSize).To(o.BeTrue())
-	g.By(fmt.Sprintf("confirming pruned size: sizeOfPruneImage=%d <= (sizeAfterPrune=%d - sizeBeforePrune=%d)", imgPrune.DockerImageMetadata.Size, keepSize, confirmSize))
-	o.Expect(imgPrune.DockerImageMetadata.Size <= keepSize-confirmSize).To(o.BeTrue())
+	g.By(fmt.Sprintf("confirming pruned size: sizeOfPruneImage=%d <= (sizeAfterPrune=%d - sizeBeforePrune=%d)", imgPrune.DockerImageMetadata.Object.(*docker10.DockerImage).Size, keepSize, confirmSize))
+	o.Expect(imgPrune.DockerImageMetadata.Object.(*docker10.DockerImage).Size <= keepSize-confirmSize).To(o.BeTrue())
 }
 
 func testSoftPruneImages(oc *exutil.CLI) {
@@ -365,7 +373,7 @@ func testPruneAllImages(oc *exutil.CLI, setAllImagesToFalse bool, schemaVersion 
 	cleanUp.AddImageStream(isName)
 	o.Expect(err).NotTo(o.HaveOccurred())
 
-	managedImage, err := oc.AsAdmin().ImageClient().Image().Images().Get(managedImageName, metav1.GetOptions{})
+	managedImage, err := oc.AsAdmin().ImageClient().ImageV1().Images().Get(managedImageName, metav1.GetOptions{})
 	o.Expect(err).NotTo(o.HaveOccurred())
 
 	externalImage, blobdgst, err := importImageAndMirrorItsSmallestBlob(oc, externalImageReference, "origin-release:latest")
@@ -430,7 +438,7 @@ func testPruneAllImages(oc *exutil.CLI, setAllImagesToFalse bool, schemaVersion 
 	checkAdminPruneOutput(output, false)
 }
 
-type byLayerSize []imageapi.ImageLayer
+type byLayerSize []imagev1.ImageLayer
 
 func (bls byLayerSize) Len() int      { return len(bls) }
 func (bls byLayerSize) Swap(i, j int) { bls[i], bls[j] = bls[j], bls[i] }
@@ -444,7 +452,7 @@ func (bls byLayerSize) Less(i, j int) bool {
 	return false
 }
 
-func importImageAndMirrorItsSmallestBlob(oc *exutil.CLI, imageReference, destISTag string) (*imageapi.Image, godigest.Digest, error) {
+func importImageAndMirrorItsSmallestBlob(oc *exutil.CLI, imageReference, destISTag string) (*imagev1.Image, godigest.Digest, error) {
 	g.By(fmt.Sprintf("importing external image %q", imageReference))
 	err := oc.Run("tag").Args("--source=docker", imageReference, destISTag).Execute()
 	if err != nil {
@@ -458,12 +466,12 @@ func importImageAndMirrorItsSmallestBlob(oc *exutil.CLI, imageReference, destIST
 	if err != nil {
 		return nil, "", err
 	}
-	istag, err := oc.ImageClient().Image().ImageStreamTags(oc.Namespace()).Get(destISTag, metav1.GetOptions{})
+	istag, err := oc.ImageClient().ImageV1().ImageStreamTags(oc.Namespace()).Get(destISTag, metav1.GetOptions{})
 	if err != nil {
 		return nil, "", err
 	}
 
-	tmpLayers := make([]imageapi.ImageLayer, 0, len(istag.Image.DockerImageLayers))
+	tmpLayers := make([]imagev1.ImageLayer, 0, len(istag.Image.DockerImageLayers))
 	for i := range istag.Image.DockerImageLayers {
 		layer := istag.Image.DockerImageLayers[i]
 		// skip empty blobs

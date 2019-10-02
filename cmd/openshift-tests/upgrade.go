@@ -8,7 +8,8 @@ import (
 
 	"github.com/spf13/pflag"
 
-	"k8s.io/kubernetes/pkg/kubectl/util/templates"
+	"k8s.io/kubectl/pkg/util/templates"
+	"k8s.io/kubernetes/test/e2e/lifecycle"
 	"k8s.io/kubernetes/test/e2e/upgrades"
 
 	"github.com/openshift/origin/pkg/test/ginkgo"
@@ -23,7 +24,9 @@ var upgradeSuites = []*ginkgo.TestSuite{
 		Description: templates.LongDesc(`
 		Run all tests.
 		`),
-		Matches: func(name string) bool { return strings.Contains(name, "[Feature:ClusterUpgrade]") },
+		Matches: func(name string) bool {
+			return strings.Contains(name, "[Feature:ClusterUpgrade]") && strings.Contains(name, "[Suite:openshift]")
+		},
 
 		Init: func(opt map[string]string) error {
 			for k, v := range opt {
@@ -91,8 +94,8 @@ func initUpgrade(value string) error {
 	}
 	for _, suite := range upgradeSuites {
 		if suite.Name == opt.Suite {
-			exutil.TestContext.UpgradeTarget = ""
-			exutil.TestContext.UpgradeImage = opt.ToImage
+			lifecycle.SetUpgradeTarget("")
+			lifecycle.SetUpgradeImage(opt.ToImage)
 			exutil.TestContext.ReportDir = opt.JUnitDir
 			o, err := opt.OptionsMap()
 			if err != nil {

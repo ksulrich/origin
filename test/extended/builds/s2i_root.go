@@ -9,9 +9,7 @@ import (
 	"k8s.io/client-go/util/retry"
 
 	buildv1 "github.com/openshift/api/build/v1"
-	buildutil "github.com/openshift/origin/pkg/build/util"
 	exutil "github.com/openshift/origin/test/extended/util"
-	s2istatus "github.com/openshift/source-to-image/pkg/util/status"
 )
 
 func Before(oc *exutil.CLI) {
@@ -44,10 +42,10 @@ var _ = g.Describe("[Feature:Builds][Conformance] s2i build with a root user ima
 		build, err := oc.BuildClient().BuildV1().Builds(oc.Namespace()).Get("nodejsfail-1", metav1.GetOptions{})
 		o.Expect(err).NotTo(o.HaveOccurred())
 		o.Expect(build.Status.Phase).To(o.Equal(buildv1.BuildPhaseFailed))
-		o.Expect(build.Status.Reason).To(o.BeEquivalentTo(s2istatus.ReasonPullBuilderImageFailed))
-		o.Expect(build.Status.Message).To(o.BeEquivalentTo(s2istatus.ReasonMessagePullBuilderImageFailed))
+		o.Expect(build.Status.Reason).To(o.BeEquivalentTo("PullBuilderImageFailed" /*s2istatus.ReasonPullBuilderImageFailed*/))
+		o.Expect(build.Status.Message).To(o.BeEquivalentTo("Failed to pull builder image." /*s2istatus.ReasonMessagePullBuilderImageFailed*/))
 
-		podname := build.Annotations[buildutil.BuildPodNameAnnotation]
+		podname := build.Annotations[buildv1.BuildPodNameAnnotation]
 		pod, err := oc.KubeClient().CoreV1().Pods(oc.Namespace()).Get(podname, metav1.GetOptions{})
 		o.Expect(err).NotTo(o.HaveOccurred())
 
@@ -70,11 +68,11 @@ var _ = g.Describe("[Feature:Builds][Conformance] s2i build with a root user ima
 		defer After(oc)
 		g.By("adding builder account to privileged SCC")
 		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
-			scc, err := oc.AdminSecurityClient().Security().SecurityContextConstraints().Get("privileged", metav1.GetOptions{})
+			scc, err := oc.AdminSecurityClient().SecurityV1().SecurityContextConstraints().Get("privileged", metav1.GetOptions{})
 			o.Expect(err).NotTo(o.HaveOccurred())
 
 			scc.Users = append(scc.Users, "system:serviceaccount:"+oc.Namespace()+":builder")
-			_, err = oc.AdminSecurityClient().Security().SecurityContextConstraints().Update(scc)
+			_, err = oc.AdminSecurityClient().SecurityV1().SecurityContextConstraints().Update(scc)
 			return err
 		})
 		o.Expect(err).NotTo(o.HaveOccurred())
@@ -88,7 +86,7 @@ var _ = g.Describe("[Feature:Builds][Conformance] s2i build with a root user ima
 		build, err := oc.BuildClient().BuildV1().Builds(oc.Namespace()).Get("nodejspass-1", metav1.GetOptions{})
 		o.Expect(err).NotTo(o.HaveOccurred())
 
-		podname := build.Annotations[buildutil.BuildPodNameAnnotation]
+		podname := build.Annotations[buildv1.BuildPodNameAnnotation]
 		pod, err := oc.KubeClient().CoreV1().Pods(oc.Namespace()).Get(podname, metav1.GetOptions{})
 		o.Expect(err).NotTo(o.HaveOccurred())
 

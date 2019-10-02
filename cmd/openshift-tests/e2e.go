@@ -4,7 +4,7 @@ import (
 	"strings"
 	"time"
 
-	"k8s.io/kubernetes/pkg/kubectl/util/templates"
+	"k8s.io/kubectl/pkg/util/templates"
 
 	"github.com/openshift/origin/pkg/test/ginkgo"
 
@@ -102,7 +102,7 @@ var staticSuites = []*ginkgo.TestSuite{
 		Tests that exercise the OpenShift / Jenkins integrations provided by the OpenShift Jenkins image/plugins and the Pipeline Build Strategy.
 		`),
 		Matches: func(name string) bool {
-			return strings.Contains(name, "openshift pipeline")
+			return strings.Contains(name, "[Feature:Jenkins]")
 		},
 		Parallelism: 3,
 		TestTimeout: 20 * time.Minute,
@@ -124,6 +124,23 @@ var staticSuites = []*ginkgo.TestSuite{
 		Run only tests that are excluded from conformance. Makes identifying omitted tests easier.
 		`),
 		Matches: func(name string) bool { return !strings.Contains(name, "[Suite:openshift/conformance/") },
+	},
+	{
+		Name: "openshift/test-cmd",
+		Description: templates.LongDesc(`
+		Run only tests for test-cmd.
+		`),
+		Matches: func(name string) bool { return strings.Contains(name, "[Suite:openshift/test-cmd]") },
+	},
+	{
+		Name: "openshift/csi",
+		Description: templates.LongDesc(`
+		Run tests for an installed CSI driver. TEST_CSI_DRIVER_FILES env. variable must be set and it must be a comma separated list of CSI driver definition files.
+        See https://github.com/kubernetes/kubernetes/blob/master/test/e2e/storage/external/README.md for required format of the files.
+		`),
+		Matches: func(name string) bool {
+			return strings.Contains(name, "[Suite:openshift/csi") && !strings.Contains(name, "[Disruptive]")
+		},
 	},
 	{
 		Name: "all",

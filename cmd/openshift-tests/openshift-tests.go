@@ -3,28 +3,37 @@ package main
 import (
 	"encoding/json"
 	"flag"
+	goflag "flag"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"math/rand"
 	"os"
+	"strings"
 	"time"
 
-	"github.com/onsi/gomega"
-
 	"github.com/onsi/ginkgo"
+	"github.com/onsi/gomega"
 	"github.com/spf13/cobra"
 	"github.com/spf13/pflag"
-	"k8s.io/klog"
 
+	utilflag "k8s.io/component-base/cli/flag"
 	"k8s.io/component-base/logs"
-	"k8s.io/kubernetes/pkg/kubectl/util/templates"
+	"k8s.io/klog"
+	"k8s.io/kubectl/pkg/util/templates"
+	reale2e "k8s.io/kubernetes/test/e2e"
 	e2e "k8s.io/kubernetes/test/e2e/framework"
+	"k8s.io/kubernetes/test/e2e/storage/external"
 
 	"github.com/openshift/library-go/pkg/serviceability"
-	"github.com/openshift/origin/pkg/cmd/flagtypes"
 	"github.com/openshift/origin/pkg/monitor"
 	testginkgo "github.com/openshift/origin/pkg/test/ginkgo"
 	exutil "github.com/openshift/origin/test/extended/util"
+	exutilazure "github.com/openshift/origin/test/extended/util/azure"
+
+	// these are loading important global flags that we need to get and set
+	_ "k8s.io/kubernetes/test/e2e"
+	_ "k8s.io/kubernetes/test/e2e/lifecycle"
 )
 
 func main() {
@@ -32,6 +41,9 @@ func main() {
 	defer logs.FlushLogs()
 
 	rand.Seed(time.Now().UTC().UnixNano())
+
+	pflag.CommandLine.SetNormalizeFunc(utilflag.WordSepNormalizeFunc)
+	pflag.CommandLine.AddGoFlagSet(goflag.CommandLine)
 
 	root := &cobra.Command{
 		Long: templates.LongDesc(`
@@ -42,7 +54,6 @@ func main() {
 		or require elevated privileges - see the descriptions of each test suite.
 		`),
 	}
-	flagtypes.GLog(root.PersistentFlags())
 
 	root.AddCommand(
 		newRunCommand(),
@@ -113,9 +124,10 @@ func newRunCommand() *cobra.Command {
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			return mirrorToFile(opt, func() error {
-				if err := initProvider(opt.Provider); err != nil {
+				if err := initProvider(opt.Provider, opt.DryRun); err != nil {
 					return err
 				}
+
 				e2e.AfterReadingAllFlags(exutil.TestContext)
 				e2e.TestContext.DumpLogsOnFailure = true
 				exutil.TestContext.DumpLogsOnFailure = true
@@ -176,7 +188,7 @@ func newRunUpgradeCommand() *cobra.Command {
 					}
 				}
 
-				if err := initProvider(opt.Provider); err != nil {
+				if err := initProvider(opt.Provider, opt.DryRun); err != nil {
 					return err
 				}
 				e2e.AfterReadingAllFlags(exutil.TestContext)
@@ -210,7 +222,7 @@ func newRunTestCommand() *cobra.Command {
 		SilenceUsage:  true,
 		SilenceErrors: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if err := initProvider(os.Getenv("TEST_PROVIDER")); err != nil {
+			if err := initProvider(os.Getenv("TEST_PROVIDER"), testOpt.DryRun); err != nil {
 				return err
 			}
 			if err := initUpgrade(os.Getenv("TEST_SUITE_OPTIONS")); err != nil {
@@ -257,26 +269,32 @@ func bindOptions(opt *testginkgo.Options, flags *pflag.FlagSet) {
 	flags.StringVar(&opt.JUnitDir, "junit-dir", opt.JUnitDir, "The directory to write test reports to.")
 	flags.StringVar(&opt.Provider, "provider", opt.Provider, "The cluster infrastructure provider. Will automatically default to the correct value.")
 	flags.StringVarP(&opt.TestFile, "file", "f", opt.TestFile, "Create a suite from the newline-delimited test names in this file.")
+	flags.StringVar(&opt.Regex, "run", opt.Regex, "Regular expression of tests to run.")
 	flags.StringVarP(&opt.OutFile, "output-file", "o", opt.OutFile, "Write all test output to this file.")
 	flags.DurationVar(&opt.Timeout, "timeout", opt.Timeout, "Set the maximum time a test can run before being aborted. This is read from the suite by default, but will be 10 minutes otherwise.")
 	flags.BoolVar(&opt.IncludeSuccessOutput, "include-success", opt.IncludeSuccessOutput, "Print output from successful tests.")
 }
 
-func initProvider(provider string) error {
+func initProvider(provider string, dryRun bool) error {
 	// record the exit error to the output file
 	if err := decodeProviderTo(provider, exutil.TestContext); err != nil {
 		return err
 	}
 	exutil.TestContext.AllowedNotReadyNodes = 100
 	exutil.TestContext.MaxNodesToGather = 0
-	exutil.TestContext.Viper = os.Getenv("VIPERCONFIG")
+	reale2e.SetViperConfig(os.Getenv("VIPERCONFIG"))
+
+	if err := initCSITests(); err != nil {
+		return err
+	}
 
 	// set defaults so these tests don't log
-	exutil.TestContext.LoggingSoak.Scale = 1
-	exutil.TestContext.LoggingSoak.MilliSecondsBetweenWaves = 5000
+	// these appear to be defaults now
+	//exutil.TestContext.LoggingSoak.Scale = 1
+	//exutil.TestContext.LoggingSoak.MilliSecondsBetweenWaves = 5000
 
 	exutil.AnnotateTestSuite()
-	exutil.InitTest()
+	exutil.InitTest(dryRun)
 	gomega.RegisterFailHandler(ginkgo.Fail)
 
 	// TODO: infer SSH keys from the cluster
@@ -292,6 +310,23 @@ func decodeProviderTo(provider string, testContext *e2e.TestContextType) error {
 			}
 		}
 		// TODO: detect which provider the cluster is running and use that as a default.
+	case "azure":
+		tmpFile, err := ioutil.TempFile("", "e2e-*")
+		if err != nil {
+			return err
+		}
+		data, err := exutilazure.LoadConfigFile()
+		if err != nil {
+			return err
+		}
+		if _, err := tmpFile.Write(data); err != nil {
+			return err
+		}
+		if err := tmpFile.Close(); err != nil {
+			return err
+		}
+		testContext.Provider = "azure"
+		testContext.CloudConfig = e2e.CloudConfig{ConfigFile: tmpFile.Name()}
 	default:
 		var providerInfo struct{ Type string }
 		if err := json.Unmarshal([]byte(provider), &providerInfo); err != nil {
@@ -309,5 +344,21 @@ func decodeProviderTo(provider string, testContext *e2e.TestContextType) error {
 		testContext.Provider = "skeleton"
 	}
 	klog.V(2).Infof("Provider %s: %#v", testContext.Provider, testContext.CloudConfig)
+	return nil
+}
+
+// Initialize openshift/csi suite, i.e. define CSI tests from TEST_CSI_DRIVER_FILES.
+func initCSITests() error {
+	// TODO: replace with cmdline argument
+	driverList := os.Getenv("TEST_CSI_DRIVER_FILES")
+	if driverList == "" {
+		return nil
+	}
+	drivers := strings.Split(driverList, ",")
+	for _, driver := range drivers {
+		if err := external.AddDriverDefinition(driver); err != nil {
+			return fmt.Errorf("failed to load driver from %q: %s", driver, err)
+		}
+	}
 	return nil
 }

@@ -31,11 +31,16 @@ import (
 	"strings"
 	"time"
 
+	"k8s.io/kubernetes/openshift-kube-apiserver/configdefault"
+	"k8s.io/kubernetes/openshift-kube-apiserver/enablement"
+	"k8s.io/kubernetes/openshift-kube-apiserver/openshiftkubeapiserver"
+
 	"github.com/go-openapi/spec"
 	"github.com/spf13/cobra"
 
+	corev1 "k8s.io/api/core/v1"
 	extensionsapiserver "k8s.io/apiextensions-apiserver/pkg/apiserver"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	utilnet "k8s.io/apimachinery/pkg/util/net"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -44,11 +49,13 @@ import (
 	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	openapinamer "k8s.io/apiserver/pkg/endpoints/openapi"
+	"k8s.io/apiserver/pkg/endpoints/request"
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	"k8s.io/apiserver/pkg/server/filters"
 	serveroptions "k8s.io/apiserver/pkg/server/options"
 	serverstorage "k8s.io/apiserver/pkg/server/storage"
 	"k8s.io/apiserver/pkg/storage/etcd3/preflight"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
 	"k8s.io/apiserver/pkg/util/term"
 	"k8s.io/apiserver/pkg/util/webhook"
 	clientgoinformers "k8s.io/client-go/informers"
@@ -57,13 +64,18 @@ import (
 	cloudprovider "k8s.io/cloud-provider"
 	cliflag "k8s.io/component-base/cli/flag"
 	"k8s.io/component-base/cli/globalflag"
+	_ "k8s.io/component-base/metrics/prometheus/workqueue" // for workqueue metric registration
+	"k8s.io/component-base/version"
 	"k8s.io/klog"
 	aggregatorapiserver "k8s.io/kube-aggregator/pkg/apiserver"
 	aggregatorscheme "k8s.io/kube-aggregator/pkg/apiserver/scheme"
 	"k8s.io/kubernetes/cmd/kube-apiserver/app/options"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
+	"k8s.io/kubernetes/pkg/apis/core"
+	v1 "k8s.io/kubernetes/pkg/apis/core/v1"
 	"k8s.io/kubernetes/pkg/capabilities"
 	serviceaccountcontroller "k8s.io/kubernetes/pkg/controller/serviceaccount"
+	"k8s.io/kubernetes/pkg/features"
 	generatedopenapi "k8s.io/kubernetes/pkg/generated/openapi"
 	"k8s.io/kubernetes/pkg/kubeapiserver"
 	kubeapiserveradmission "k8s.io/kubernetes/pkg/kubeapiserver/admission"
@@ -75,21 +87,21 @@ import (
 	"k8s.io/kubernetes/pkg/master/reconcilers"
 	"k8s.io/kubernetes/pkg/master/tunneler"
 	"k8s.io/kubernetes/pkg/registry/cachesize"
+	eventstorage "k8s.io/kubernetes/pkg/registry/core/event/storage"
 	rbacrest "k8s.io/kubernetes/pkg/registry/rbac/rest"
 	"k8s.io/kubernetes/pkg/serviceaccount"
 	utilflag "k8s.io/kubernetes/pkg/util/flag"
-	_ "k8s.io/kubernetes/pkg/util/reflector/prometheus" // for reflector metric registration
-	_ "k8s.io/kubernetes/pkg/util/workqueue/prometheus" // for workqueue metric registration
-	"k8s.io/kubernetes/pkg/version"
 	"k8s.io/kubernetes/pkg/version/verflag"
 	"k8s.io/kubernetes/plugin/pkg/auth/authenticator/token/bootstrap"
 )
 
-const etcdRetryLimit = 60
-const etcdRetryInterval = 1 * time.Second
+const (
+	etcdRetryLimit    = 60
+	etcdRetryInterval = 1 * time.Second
+)
 
 // NewAPIServerCommand creates a *cobra.Command object with default parameters
-func NewAPIServerCommand(stopCh <-chan struct{}) *cobra.Command {
+func NewAPIServerCommand() *cobra.Command {
 	s := options.NewServerRunOptions()
 	cmd := &cobra.Command{
 		Use: "kube-apiserver",
@@ -100,6 +112,33 @@ cluster's shared state through which all other components interact.`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			verflag.PrintAndExitIfRequested()
 			utilflag.PrintFlags(cmd.Flags())
+
+			if len(s.OpenShiftConfig) > 0 {
+				enablement.ForceOpenShift()
+				openshiftConfig, err := enablement.GetOpenshiftConfig(s.OpenShiftConfig)
+				if err != nil {
+					klog.Fatal(err)
+				}
+
+				// this forces a patch to be called
+				// TODO we're going to try to remove bits of the patching.
+				configPatchFn, serverPatchContext := openshiftkubeapiserver.NewOpenShiftKubeAPIServerConfigPatch(genericapiserver.NewEmptyDelegate(), openshiftConfig)
+				OpenShiftKubeAPIServerConfigPatch = configPatchFn
+				OpenShiftKubeAPIServerServerPatch = serverPatchContext.PatchServer
+
+				args, err := openshiftkubeapiserver.ConfigToFlags(openshiftConfig)
+				if err != nil {
+					return err
+				}
+				// hopefully this resets the flags?
+				if err := cmd.ParseFlags(args); err != nil {
+					return err
+				}
+
+				enablement.ForceGlobalInitializationForOpenShift(s)
+				enablement.InstallOpenShiftAdmissionPlugins(s)
+
+			}
 
 			// set default options
 			completedOptions, err := Complete(s)
@@ -112,7 +151,7 @@ cluster's shared state through which all other components interact.`,
 				return utilerrors.NewAggregate(errs)
 			}
 
-			return Run(completedOptions, stopCh)
+			return Run(completedOptions, genericapiserver.SetupSignalHandler())
 		},
 	}
 
@@ -150,11 +189,16 @@ func Run(completeOptions completedServerRunOptions, stopCh <-chan struct{}) erro
 		return err
 	}
 
-	return server.PrepareRun().Run(stopCh)
+	prepared, err := server.PrepareRun()
+	if err != nil {
+		return err
+	}
+
+	return prepared.Run(stopCh)
 }
 
 // CreateServerChain creates the apiservers connected via delegation.
-func CreateServerChain(completedOptions completedServerRunOptions, stopCh <-chan struct{}) (*genericapiserver.GenericAPIServer, error) {
+func CreateServerChain(completedOptions completedServerRunOptions, stopCh <-chan struct{}) (*aggregatorapiserver.APIAggregator, error) {
 	nodeTunneler, proxyTransport, err := CreateNodeDialer(completedOptions)
 	if err != nil {
 		return nil, err
@@ -185,13 +229,6 @@ func CreateServerChain(completedOptions completedServerRunOptions, stopCh <-chan
 		return nil, err
 	}
 
-	// otherwise go down the normal path of standing the aggregator up in front of the API server
-	// this wires up openapi
-	kubeAPIServer.GenericAPIServer.PrepareRun()
-
-	// This will wire up openapi for extension api server
-	apiExtensionsServer.GenericAPIServer.PrepareRun()
-
 	// aggregator comes last in the chain
 	aggregatorConfig, err := createAggregatorConfig(*kubeAPIServerConfig.GenericConfig, completedOptions.ServerRunOptions, kubeAPIServerConfig.ExtraConfig.VersionedInformers, serviceResolver, proxyTransport, pluginInitializer)
 	if err != nil {
@@ -210,7 +247,7 @@ func CreateServerChain(completedOptions completedServerRunOptions, stopCh <-chan
 		}
 	}
 
-	return aggregatorServer.GenericAPIServer, nil
+	return aggregatorServer, nil
 }
 
 // CreateKubeAPIServer creates and wires a workable kube-apiserver
@@ -309,9 +346,19 @@ func CreateKubeAPIServerConfig(
 		PerConnectionBandwidthLimitBytesPerSec: s.MaxConnectionBytesPerSec,
 	})
 
-	serviceIPRange, apiServerServiceIP, lastErr := master.DefaultServiceIPRange(s.ServiceClusterIPRange)
+	serviceIPRange, apiServerServiceIP, lastErr := master.DefaultServiceIPRange(s.PrimaryServiceClusterIPRange)
 	if lastErr != nil {
 		return
+	}
+
+	// defaults to empty range and ip
+	var secondaryServiceIPRange net.IPNet
+	// process secondary range only if provided by user
+	if s.SecondaryServiceClusterIPRange.IP != nil {
+		secondaryServiceIPRange, _, lastErr = master.DefaultServiceIPRange(s.SecondaryServiceClusterIPRange)
+		if lastErr != nil {
+			return
+		}
 	}
 
 	clientCA, lastErr := readCAorNil(s.Authentication.ClientCert.ClientCA)
@@ -322,6 +369,13 @@ func CreateKubeAPIServerConfig(
 	if lastErr != nil {
 		return
 	}
+
+	var eventStorage *eventstorage.REST
+	eventStorage, lastErr = eventstorage.NewREST(genericConfig.RESTOptionsGetter, uint64(s.EventTTL.Seconds()))
+	if lastErr != nil {
+		return
+	}
+	genericConfig.EventSink = eventRegistrySink{eventStorage}
 
 	config = &master.Config{
 		GenericConfig: genericConfig,
@@ -344,8 +398,10 @@ func CreateKubeAPIServerConfig(
 
 			Tunneler: nodeTunneler,
 
-			ServiceIPRange:       serviceIPRange,
-			APIServerServiceIP:   apiServerServiceIP,
+			ServiceIPRange:          serviceIPRange,
+			APIServerServiceIP:      apiServerServiceIP,
+			SecondaryServiceIPRange: secondaryServiceIPRange,
+
 			APIServerServicePort: 443,
 
 			ServiceNodePortRange:      s.ServiceNodePortRange,
@@ -364,6 +420,10 @@ func CreateKubeAPIServerConfig(
 	if nodeTunneler != nil {
 		// Use the nodeTunneler's dialer to connect to the kubelet
 		config.ExtraConfig.KubeletClientConfig.Dial = nodeTunneler.Dial
+	}
+	if config.GenericConfig.EgressSelector != nil {
+		// Use the config.GenericConfig.EgressSelector lookup to find the dialer to connect to the kubelet
+		config.ExtraConfig.KubeletClientConfig.Lookup = config.GenericConfig.EgressSelector.Lookup
 	}
 
 	return
@@ -406,6 +466,9 @@ func buildGenericConfig(
 	if lastErr = s.APIEnablement.ApplyTo(genericConfig, master.DefaultAPIResourceConfigSource(), legacyscheme.Scheme); lastErr != nil {
 		return
 	}
+	if lastErr = s.EgressSelector.ApplyTo(genericConfig); lastErr != nil {
+		return
+	}
 
 	genericConfig.OpenAPIConfig = genericapiserver.DefaultOpenAPIConfig(generatedopenapi.GetOpenAPIDefinitions, openapinamer.NewDefinitionNamer(legacyscheme.Scheme, extensionsapiserver.Scheme, aggregatorscheme.Scheme))
 	genericConfig.OpenAPIConfig.Info.Title = "Kubernetes"
@@ -428,6 +491,9 @@ func buildGenericConfig(
 	if lastErr != nil {
 		return
 	}
+	if genericConfig.EgressSelector != nil {
+		storageFactory.StorageConfig.Transport.EgressLookup = genericConfig.EgressSelector.Lookup
+	}
 	if lastErr = s.Etcd.ApplyWithStorageFactoryTo(storageFactory, genericConfig); lastErr != nil {
 		return
 	}
@@ -437,6 +503,9 @@ func buildGenericConfig(
 	// cannot default to it in generic apiserver and need to explicitly
 	// set it in kube-apiserver.
 	genericConfig.LoopbackClientConfig.ContentConfig.ContentType = "application/vnd.kubernetes.protobuf"
+	// Disable compression for self-communication, since we are going to be
+	// on a fast local network
+	genericConfig.LoopbackClientConfig.DisableCompression = true
 
 	kubeClientConfig := genericConfig.LoopbackClientConfig
 	clientgoExternalClient, err := clientgoclientset.NewForConfig(kubeClientConfig)
@@ -496,6 +565,9 @@ func buildGenericConfig(
 		return
 	}
 
+	if enablement.IsOpenShift() {
+		configdefault.SetAdmissionDefaults(s, versionedInformers, clientgoExternalClient)
+	}
 	err = s.Admission.ApplyTo(
 		genericConfig,
 		versionedInformers,
@@ -511,7 +583,7 @@ func buildGenericConfig(
 // BuildAuthenticator constructs the authenticator
 func BuildAuthenticator(s *options.ServerRunOptions, extclient clientgoclientset.Interface, versionedInformer clientgoinformers.SharedInformerFactory) (authenticator.Request, *spec.SecurityDefinitions, map[string]genericapiserver.PostStartHookFunc, error) {
 	authenticatorConfig := s.Authentication.ToAuthenticationConfig()
-	if s.Authentication.ServiceAccounts.Lookup {
+	if s.Authentication.ServiceAccounts.Lookup || utilfeature.DefaultFeatureGate.Enabled(features.TokenRequest) {
 		authenticatorConfig.ServiceAccountTokenGetter = serviceaccountcontroller.NewGetterFromClient(
 			extclient,
 			versionedInformer.Core().V1().Secrets().Lister(),
@@ -520,7 +592,7 @@ func BuildAuthenticator(s *options.ServerRunOptions, extclient clientgoclientset
 		)
 	}
 	authenticatorConfig.BootstrapTokenAuthenticator = bootstrap.NewTokenAuthenticator(
-		versionedInformer.Core().V1().Secrets().Lister().Secrets(v1.NamespaceSystem),
+		versionedInformer.Core().V1().Secrets().Lister().Secrets(metav1.NamespaceSystem),
 	)
 
 	return authenticatorConfig.New()
@@ -548,11 +620,49 @@ func Complete(s *options.ServerRunOptions) (completedServerRunOptions, error) {
 	if err := kubeoptions.DefaultAdvertiseAddress(s.GenericServerRunOptions, s.InsecureServing.DeprecatedInsecureServingOptions); err != nil {
 		return options, err
 	}
-	serviceIPRange, apiServerServiceIP, err := master.DefaultServiceIPRange(s.ServiceClusterIPRange)
-	if err != nil {
-		return options, fmt.Errorf("error determining service IP ranges: %v", err)
+
+	// process s.ServiceClusterIPRange from list to Primary and Secondary
+	// we process secondary only if provided by user
+
+	serviceClusterIPRangeList := strings.Split(s.ServiceClusterIPRanges, ",")
+
+	var apiServerServiceIP net.IP
+	var serviceIPRange net.IPNet
+	var err error
+	// nothing provided by user, use default range (only applies to the Primary)
+	if len(serviceClusterIPRangeList) == 0 {
+		var primaryServiceClusterCIDR net.IPNet
+		serviceIPRange, apiServerServiceIP, err = master.DefaultServiceIPRange(primaryServiceClusterCIDR)
+		if err != nil {
+			return options, fmt.Errorf("error determining service IP ranges: %v", err)
+		}
+		s.PrimaryServiceClusterIPRange = serviceIPRange
 	}
-	s.ServiceClusterIPRange = serviceIPRange
+
+	if len(serviceClusterIPRangeList) > 0 {
+		_, primaryServiceClusterCIDR, err := net.ParseCIDR(serviceClusterIPRangeList[0])
+		if err != nil {
+			return options, fmt.Errorf("service-cluster-ip-range[0] is not a valid cidr")
+		}
+
+		serviceIPRange, apiServerServiceIP, err = master.DefaultServiceIPRange(*(primaryServiceClusterCIDR))
+		if err != nil {
+			return options, fmt.Errorf("error determining service IP ranges for primary service cidr: %v", err)
+		}
+		s.PrimaryServiceClusterIPRange = serviceIPRange
+	}
+
+	// user provided at least two entries
+	if len(serviceClusterIPRangeList) > 1 {
+		_, secondaryServiceClusterCIDR, err := net.ParseCIDR(serviceClusterIPRangeList[1])
+		if err != nil {
+			return options, fmt.Errorf("service-cluster-ip-range[1] is not an ip net")
+		}
+
+		s.SecondaryServiceClusterIPRange = *(secondaryServiceClusterCIDR)
+	}
+	//note: validation asserts that the list is max of two dual stack entries
+
 	if err := s.SecureServing.MaybeDefaultWithSelfSignedCerts(s.GenericServerRunOptions.AdvertiseAddress.String(), []string{"kubernetes.default.svc", "kubernetes.default", "kubernetes"}, []net.IP{apiServerServiceIP}); err != nil {
 		return options, fmt.Errorf("error creating self-signed certificates: %v", err)
 	}
@@ -623,7 +733,6 @@ func Complete(s *options.ServerRunOptions) (completedServerRunOptions, error) {
 		}
 	}
 
-	// TODO: remove when we stop supporting the legacy group version.
 	if s.APIEnablement.RuntimeConfig != nil {
 		for key, value := range s.APIEnablement.RuntimeConfig {
 			if key == "v1" || strings.HasPrefix(key, "v1/") ||
@@ -664,4 +773,36 @@ func readCAorNil(file string) ([]byte, error) {
 		return nil, nil
 	}
 	return ioutil.ReadFile(file)
+}
+
+// eventRegistrySink wraps an event registry in order to be used as direct event sync, without going through the API.
+type eventRegistrySink struct {
+	*eventstorage.REST
+}
+
+var _ genericapiserver.EventSink = eventRegistrySink{}
+
+func (s eventRegistrySink) Create(v1event *corev1.Event) (*corev1.Event, error) {
+	ctx := request.WithNamespace(request.NewContext(), v1event.Namespace)
+
+	var event core.Event
+	if err := v1.Convert_v1_Event_To_core_Event(v1event, &event, nil); err != nil {
+		return nil, err
+	}
+
+	obj, err := s.REST.Create(ctx, &event, nil, &metav1.CreateOptions{})
+	if err != nil {
+		return nil, err
+	}
+	ret, ok := obj.(*core.Event)
+	if !ok {
+		return nil, fmt.Errorf("expected corev1.Event, got %T", obj)
+	}
+
+	var v1ret corev1.Event
+	if err := v1.Convert_core_Event_To_v1_Event(ret, &v1ret, nil); err != nil {
+		return nil, err
+	}
+
+	return &v1ret, nil
 }

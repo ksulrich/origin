@@ -17,13 +17,14 @@ limitations under the License.
 package lifecycle
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"time"
 
 	"k8s.io/klog"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -56,6 +57,8 @@ func Register(plugins *admission.Plugins) {
 		return NewLifecycle(sets.NewString(metav1.NamespaceDefault, metav1.NamespaceSystem, metav1.NamespacePublic,
 			// user specified configuration that cannot be rebuilt
 			"openshift-config",
+			// cluster generated configuration that cannot be rebuilt (etcd encryption keys)
+			"openshift-config-managed",
 			// the CVO which is the root we use to rebuild all the rest
 			"openshift-cluster-version",
 			// contains a namespaced list of all nodes in the cluster (yeah, weird.  they do it for multi-tenant management I think?)
@@ -80,7 +83,7 @@ var _ = initializer.WantsExternalKubeInformerFactory(&Lifecycle{})
 var _ = initializer.WantsExternalKubeClientSet(&Lifecycle{})
 
 // Admit makes an admission decision based on the request attributes
-func (l *Lifecycle) Admit(a admission.Attributes, o admission.ObjectInterfaces) error {
+func (l *Lifecycle) Admit(ctx context.Context, a admission.Attributes, o admission.ObjectInterfaces) error {
 	// prevent deletion of immortal namespaces
 	if a.GetOperation() == admission.Delete && a.GetKind().GroupKind() == v1.SchemeGroupVersion.WithKind("Namespace").GroupKind() && l.immortalNamespaces.Has(a.GetName()) {
 		return errors.NewForbidden(a.GetResource().GroupResource(), a.GetName(), fmt.Errorf("this namespace may not be deleted"))
@@ -223,19 +226,7 @@ func (l *Lifecycle) ValidateInitialization() error {
 // accessReviewResources are resources which give a view into permissions in a namespace.  Users must be allowed to create these
 // resources because returning "not found" errors allows someone to search for the "people I'm going to fire in 2017" namespace.
 var accessReviewResources = map[schema.GroupResource]bool{
-	{Group: "authorization.k8s.io", Resource: "localsubjectaccessreviews"}:                            true,
-	schema.GroupResource{Group: "", Resource: "subjectaccessreviews"}:                                 true,
-	schema.GroupResource{Group: "", Resource: "localsubjectaccessreviews"}:                            true,
-	schema.GroupResource{Group: "", Resource: "resourceaccessreviews"}:                                true,
-	schema.GroupResource{Group: "", Resource: "localresourceaccessreviews"}:                           true,
-	schema.GroupResource{Group: "", Resource: "selfsubjectrulesreviews"}:                              true,
-	schema.GroupResource{Group: "", Resource: "subjectrulesreviews"}:                                  true,
-	schema.GroupResource{Group: "authorization.openshift.io", Resource: "subjectaccessreviews"}:       true,
-	schema.GroupResource{Group: "authorization.openshift.io", Resource: "localsubjectaccessreviews"}:  true,
-	schema.GroupResource{Group: "authorization.openshift.io", Resource: "resourceaccessreviews"}:      true,
-	schema.GroupResource{Group: "authorization.openshift.io", Resource: "localresourceaccessreviews"}: true,
-	schema.GroupResource{Group: "authorization.openshift.io", Resource: "selfsubjectrulesreviews"}:    true,
-	schema.GroupResource{Group: "authorization.openshift.io", Resource: "subjectrulesreviews"}:        true,
+	{Group: "authorization.k8s.io", Resource: "localsubjectaccessreviews"}: true,
 }
 
 func isAccessReview(a admission.Attributes) bool {

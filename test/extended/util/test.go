@@ -18,11 +18,10 @@ import (
 	"k8s.io/klog"
 
 	kapiv1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
 	apierrs "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
-	"k8s.io/cli-runtime/pkg/genericclioptions"
-	"k8s.io/cli-runtime/pkg/printers"
 	kclientset "k8s.io/client-go/kubernetes"
 	rbacv1client "k8s.io/client-go/kubernetes/typed/rbac/v1"
 	"k8s.io/client-go/tools/clientcmd"
@@ -31,11 +30,12 @@ import (
 	"k8s.io/kubernetes/test/e2e/framework/testfiles"
 	"k8s.io/kubernetes/test/e2e/generated"
 
-	"github.com/openshift/origin/pkg/cmd/server/bootstrappolicy"
-	"github.com/openshift/origin/pkg/oc/cli/admin/policy"
-	securityclient "github.com/openshift/origin/pkg/security/generated/internalclientset"
+	// this appears to inexplicably auto-register global flags.
+	_ "k8s.io/kubernetes/test/e2e/storage/drivers"
+
+	projectv1 "github.com/openshift/api/project/v1"
+	securityv1client "github.com/openshift/client-go/security/clientset/versioned"
 	"github.com/openshift/origin/pkg/version"
-	testutil "github.com/openshift/origin/test/util"
 )
 
 var (
@@ -46,24 +46,15 @@ var (
 
 var TestContext *e2e.TestContextType = &e2e.TestContext
 
-// init initialize the extended testing suite.
-// You can set these environment variables to configure extended tests:
-// KUBECONFIG - Path to kubeconfig containing embedded authinfo
-// TEST_REPORT_DIR - If set, JUnit output will be written to this directory for each test
-// TEST_REPORT_FILE_NAME - If set, will determine the name of the file that JUnit output is written to
-func Init() {
-	flag.StringVar(&syntheticSuite, "suite", "", "DEPRECATED: Optional suite selector to filter which tests are run. Use focus.")
-	e2e.ViperizeFlags()
-	InitTest()
-}
-
 func InitStandardFlags() {
-	e2e.RegisterCommonFlags()
-	e2e.RegisterClusterFlags()
-	e2e.RegisterStorageFlags()
+	e2e.RegisterCommonFlags(flag.CommandLine)
+	e2e.RegisterClusterFlags(flag.CommandLine)
+
+	// replaced by a bare import above.
+	//e2e.RegisterStorageFlags()
 }
 
-func InitTest() {
+func InitTest(dryRun bool) {
 	InitDefaultEnvironmentVariables()
 	// interpret synthetic input in `--ginkgo.focus` and/or `--ginkgo.skip`
 	ginkgo.BeforeEach(checkSyntheticInput)
@@ -86,10 +77,12 @@ func InitTest() {
 	// load and set the host variable for kubectl
 	clientConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(&clientcmd.ClientConfigLoadingRules{ExplicitPath: TestContext.KubeConfig}, &clientcmd.ConfigOverrides{})
 	cfg, err := clientConfig.ClientConfig()
-	if err != nil {
+	if err != nil && !dryRun { // we don't need the host when doing a dryrun
 		FatalErr(err)
 	}
-	TestContext.Host = cfg.Host
+	if cfg != nil {
+		TestContext.Host = cfg.Host
+	}
 
 	reportFileName = os.Getenv("TEST_REPORT_FILE_NAME")
 	if reportFileName == "" {
@@ -139,10 +132,26 @@ func ExecuteTest(t ginkgo.GinkgoTestingT, suite string) {
 }
 
 func AnnotateTestSuite() {
+	testRenamer := newGinkgoTestRenamerFromGlobals(e2e.TestContext.Provider, getNetworkSkips())
+
+	ginkgo.WalkTests(testRenamer.maybeRenameTest)
+}
+
+func getNetworkSkips() []string {
+	out, err := e2e.KubectlCmd("get", "network.operator.openshift.io", "cluster", "--template", "{{.spec.defaultNetwork.type}}{{if .spec.defaultNetwork.openshiftSDNConfig}} {{.spec.defaultNetwork.type}}/{{.spec.defaultNetwork.openshiftSDNConfig.mode}}{{end}}").CombinedOutput()
+	if err != nil {
+		e2e.Logf("Could not get network operator configuration: not adding any plugin-specific skips")
+		return nil
+	}
+	return strings.Split(string(out), " ")
+}
+
+func newGinkgoTestRenamerFromGlobals(provider string, networkSkips []string) *ginkgoTestRenamer {
 	var allLabels []string
 	matches := make(map[string]*regexp.Regexp)
 	stringMatches := make(map[string][]string)
 	excludes := make(map[string]*regexp.Regexp)
+
 	for label, items := range testMaps {
 		sort.Strings(items)
 		allLabels = append(allLabels, label)
@@ -165,64 +174,92 @@ func AnnotateTestSuite() {
 	}
 	sort.Strings(allLabels)
 
-	ginkgo.WalkTests(func(name string, node types.TestNode) {
-		labels := ""
-		for {
-			count := 0
-			for _, label := range allLabels {
-				if strings.Contains(name, label) {
+	if provider != "" {
+		excludedTests = append(excludedTests, fmt.Sprintf(`\[Skipped:%s\]`, provider))
+	}
+	for _, network := range networkSkips {
+		excludedTests = append(excludedTests, fmt.Sprintf(`\[Skipped:Network/%s\]`, network))
+	}
+	klog.Infof("openshift-tests excluded test regex is %q", strings.Join(excludedTests, `|`))
+	excludedTestsFilter := regexp.MustCompile(strings.Join(excludedTests, `|`))
+
+	return &ginkgoTestRenamer{
+		allLabels:     allLabels,
+		stringMatches: stringMatches,
+		matches:       matches,
+		excludes:      excludes,
+
+		excludedTestsFilter: excludedTestsFilter,
+	}
+}
+
+type ginkgoTestRenamer struct {
+	allLabels     []string
+	stringMatches map[string][]string
+	matches       map[string]*regexp.Regexp
+	excludes      map[string]*regexp.Regexp
+
+	excludedTestsFilter *regexp.Regexp
+}
+
+func (r *ginkgoTestRenamer) maybeRenameTest(name string, node types.TestNode) {
+	labels := ""
+	for {
+		count := 0
+		for _, label := range r.allLabels {
+			if strings.Contains(name, label) {
+				continue
+			}
+
+			var hasLabel bool
+			for _, segment := range r.stringMatches[label] {
+				hasLabel = strings.Contains(name, segment)
+				if hasLabel {
+					break
+				}
+			}
+			if !hasLabel {
+				if re := r.matches[label]; re != nil {
+					hasLabel = r.matches[label].MatchString(name)
+				}
+			}
+
+			if hasLabel {
+				// TODO: remove when we no longer need it
+				if re, ok := r.excludes[label]; ok && re.MatchString(name) {
 					continue
 				}
+				count++
+				labels += " " + label
+				name += " " + label
+			}
+		}
+		if count == 0 {
+			break
+		}
+	}
 
-				var hasLabel bool
-				for _, segment := range stringMatches[label] {
-					hasLabel = strings.Contains(name, segment)
-					if hasLabel {
-						break
-					}
-				}
-				if !hasLabel {
-					if re := matches[label]; re != nil {
-						hasLabel = matches[label].MatchString(name)
-					}
-				}
-
-				if hasLabel {
-					// TODO: remove when we no longer need it
-					if re, ok := excludes[label]; ok && re.MatchString(name) {
-						continue
-					}
-					count++
-					labels += " " + label
-					name += " " + label
-				}
-			}
-			if count == 0 {
-				break
-			}
+	if !r.excludedTestsFilter.MatchString(name) {
+		isSerial := strings.Contains(name, "[Serial]")
+		isConformance := strings.Contains(name, "[Conformance]")
+		switch {
+		case isSerial && isConformance:
+			node.SetText(node.Text() + " [Suite:openshift/conformance/serial/minimal]")
+		case isSerial:
+			node.SetText(node.Text() + " [Suite:openshift/conformance/serial]")
+		case isConformance:
+			node.SetText(node.Text() + " [Suite:openshift/conformance/parallel/minimal]")
+		default:
+			node.SetText(node.Text() + " [Suite:openshift/conformance/parallel]")
 		}
-		if !excludedTestsFilter.MatchString(name) {
-			isSerial := strings.Contains(name, "[Serial]")
-			isConformance := strings.Contains(name, "[Conformance]")
-			switch {
-			case isSerial && isConformance:
-				node.SetText(node.Text() + " [Suite:openshift/conformance/serial/minimal]")
-			case isSerial:
-				node.SetText(node.Text() + " [Suite:openshift/conformance/serial]")
-			case isConformance:
-				node.SetText(node.Text() + " [Suite:openshift/conformance/parallel/minimal]")
-			default:
-				node.SetText(node.Text() + " [Suite:openshift/conformance/parallel]")
-			}
-		}
-		if strings.Contains(node.CodeLocation().FileName, "/origin/test/") && !strings.Contains(node.Text(), "[Suite:openshift") {
-			node.SetText(node.Text() + " [Suite:openshift]")
-		}
-		if strings.Contains(node.CodeLocation().FileName, "/kubernetes/test/e2e/") {
-			node.SetText(node.Text() + " [Suite:k8s]")
-		}
-		node.SetText(node.Text() + labels)
-	})
+	}
+	if strings.Contains(node.CodeLocation().FileName, "/origin/test/") && !strings.Contains(node.Text(), "[Suite:openshift") {
+		node.SetText(node.Text() + " [Suite:openshift]")
+	}
+	if strings.Contains(node.CodeLocation().FileName, "/kubernetes/test/e2e/") {
+		node.SetText(node.Text() + " [Suite:k8s]")
+	}
+	node.SetText(node.Text() + labels)
 }
 
 // ProwGCPSetup makes sure certain required env vars are available in the case
@@ -262,6 +299,9 @@ func skipTestNamespaceCustomization() bool {
 
 // createTestingNS ensures that kubernetes e2e tests have their service accounts in the privileged and anyuid SCCs
 func createTestingNS(baseName string, c kclientset.Interface, labels map[string]string) (*kapiv1.Namespace, error) {
+	if !strings.HasPrefix(baseName, "e2e-") {
+		baseName = "e2e-" + baseName
+	}
 	ns, err := e2e.CreateTestingNS(baseName, c, labels)
 	if err != nil {
 		return ns, err
@@ -271,11 +311,11 @@ func createTestingNS(baseName string, c kclientset.Interface, labels map[string]
 
 	// Add anyuid and privileged permissions for upstream tests
 	if (isKubernetesE2ETest() && !skipTestNamespaceCustomization()) || isOriginUpgradeTest() {
-		clientConfig, err := testutil.GetClusterAdminClientConfig(KubeConfigPath())
+		clientConfig, err := getClientConfig(KubeConfigPath())
 		if err != nil {
 			return ns, err
 		}
-		securityClient, err := securityclient.NewForConfig(clientConfig)
+		securityClient, err := securityv1client.NewForConfig(clientConfig)
 		if err != nil {
 			return ns, err
 		}
@@ -297,7 +337,7 @@ func createTestingNS(baseName string, c kclientset.Interface, labels map[string]
 		if err != nil {
 			return ns, err
 		}
-		addRoleToE2EServiceAccounts(rbacClient, []kapiv1.Namespace{*ns}, bootstrappolicy.ViewRoleName)
+		addRoleToE2EServiceAccounts(rbacClient, []kapiv1.Namespace{*ns}, "view")
 
 		// in practice too many kube tests ignore scheduling constraints
 		allowAllNodeScheduling(c, ns.Name)
@@ -318,10 +358,12 @@ var (
 			`\[Feature:Initializers\]`,     // admission controller disabled
 			`\[Feature:TTLAfterFinished\]`, // flag gate is off
 			`\[Feature:GPUDevicePlugin\]`,  // GPU node needs to be available
-			`\[Feature:ExpandCSIVolumes\]`, // off by default .  sig-storage
-			`\[Feature:DynamicAudit\]`,     // off by default.  sig-master
+			`\[sig-scheduling\] GPUDevicePluginAcrossRecreate \[Feature:Recreate\]`, // GPU node needs to be available
+			`\[Feature:ExpandCSIVolumes\]`,                                          // off by default .  sig-storage
+			`\[Feature:DynamicAudit\]`,                                              // off by default.  sig-master
 
 			`\[NodeAlphaFeature:VolumeSubpathEnvExpansion\]`, // flag gate is off
+			`\[Feature:IPv6DualStack.*\]`,
 		},
 		// tests for features that are not implemented in openshift
 		"[Disabled:Unimplemented]": {
@@ -334,29 +376,24 @@ var (
 			`Kubernetes Dashboard`,            // Not installed by default (also probably slow image pull)
 			`\[Feature:ServiceLoadBalancer\]`, // Not enabled yet
 			`\[Feature:RuntimeClass\]`,        // disable runtimeclass tests in 4.1 (sig-pod/sjenning@redhat.com)
-			`\[Feature:CustomResourceWebhookConversion\]`, // webhook conversion is off by default.  sig-master/@sttts
-			`CSI mock volume`, // mock volumes don't see work right.  Newly enabledin 1.14. sig-storage
 
-			`NetworkPolicy between server and client should allow egress access on one named port`, // not yet implemented
-
-			`should proxy to cadvisor`, // we don't expose cAdvisor port directly for security reasons
+			`NetworkPolicy.*egress`,     // not supported
+			`NetworkPolicy.*named port`, // not yet implemented
+			`enforce egress policy`,     // not support
+			`should proxy to cadvisor`,  // we don't expose cAdvisor port directly for security reasons
 		},
 		// tests that rely on special configuration that we do not yet support
 		"[Disabled:SpecialConfig]": {
 			`\[Feature:ImageQuota\]`,                    // Quota isn't turned on by default, we should do that and then reenable these tests
 			`\[Feature:Audit\]`,                         // Needs special configuration
 			`\[Feature:LocalStorageCapacityIsolation\]`, // relies on a separate daemonset?
+			`\[sig-cluster-lifecycle\]`,                 // cluster lifecycle test require a different kind of upgrade hook.
+			`\[Feature:StatefulUpgrade\]`,               // related to cluster lifecycle (in e2e/lifecycle package) and requires an upgrade hook we don't use
 
 			`kube-dns-autoscaler`, // Don't run kube-dns
 			`should check if Kubernetes master services is included in cluster-info`, // Don't run kube-dns
 			`DNS configMap`, // this tests dns federation configuration via configmap, which we don't support yet
 
-			// vSphere tests can be skipped generally
-			`vsphere`,
-			`Cinder`, // requires an OpenStack cluster
-			// See the CanSupport implementation in upstream to determine wether these work.
-			`Ceph RBD`,                              // Works if ceph-common Binary installed (but we can't guarantee this on all clusters).
-			`GlusterFS`,                             // May work if /sbin/mount.glusterfs to be installed for plugin to work (also possibly blocked by serial pulling)
 			`authentication: OpenLDAP`,              // needs separate setup and bucketing for openldap bootstrapping
 			`NodeProblemDetector`,                   // requires a non-master node to run on
 			`Advanced Audit should audit API calls`, // expects to be able to call /logs
@@ -366,41 +403,69 @@ var (
 		// tests that are known broken and need to be fixed upstream or in openshift
 		// always add an issue here
 		"[Disabled:Broken]": {
-			`mount an API token into pods`,                                     // We add 6 secrets, not 1
-			`ServiceAccounts should ensure a single API token exists`,          // We create lots of secrets
-			`unchanging, static URL paths for kubernetes api services`,         // the test needs to exclude URLs that are not part of conformance (/logs)
-			"PersistentVolumes NFS when invoking the Recycle reclaim policy",   // failing for some reason
-			`Simple pod should handle in-cluster config`,                       // kubectl cp is not preserving executable bit
-			`Services should be able to up and down services`,                  // we don't have wget installed on nodes
-			`Network should set TCP CLOSE_WAIT timeout`,                        // possibly some difference between ubuntu and fedora
-			`Services should be able to create a functioning NodePort service`, // https://bugzilla.redhat.com/show_bug.cgi?id=1711603
-			`\[NodeFeature:Sysctls\]`,                                          // needs SCC support
-			`should check kube-proxy urls`,                                     // previously this test was skipped b/c we reported -1 as the number of nodes, now we report proper number and test fails
-			`extremely long build/bc names are not problematic`,                // there's a problem in kubelet when creating log directory in vendor/k8s.io/kubernetes/pkg/kubelet/kuberuntime/helpers.go:181, this changed in https://github.com/kubernetes/kubernetes/pull/74441
-			`SSH`, // TRIAGE
-			`should implement service.kubernetes.io/service-proxy-name`, // this is an optional test that requires SSH. sig-network
-			`should idle the service and DeploymentConfig properly`,     // idling with a single service and DeploymentConfig [Conformance]
-			`\[Driver: rbd\]`,        // https://bugzilla.redhat.com/show_bug.cgi?id=1711599, RBD drivers are not available in controllers?
-			`\[Driver: csi-hostpath`, // https://bugzilla.redhat.com/show_bug.cgi?id=1711607
+			`mount an API token into pods`,                                               // We add 6 secrets, not 1
+			`ServiceAccounts should ensure a single API token exists`,                    // We create lots of secrets
+			`unchanging, static URL paths for kubernetes api services`,                   // the test needs to exclude URLs that are not part of conformance (/logs)
+			`Simple pod should handle in-cluster config`,                                 // kubectl cp is not preserving executable bit
+			`Services should be able to up and down services`,                            // we don't have wget installed on nodes
+			`Network should set TCP CLOSE_WAIT timeout`,                                  // possibly some difference between ubuntu and fedora
+			`Services should be able to create a functioning NodePort service`,           // https://bugzilla.redhat.com/show_bug.cgi?id=1711603
+			`\[NodeFeature:Sysctls\]`,                                                    // needs SCC support
+			`should check kube-proxy urls`,                                               // previously this test was skipped b/c we reported -1 as the number of nodes, now we report proper number and test fails
+			`SSH`,                                                                        // TRIAGE
+			`should implement service.kubernetes.io/service-proxy-name`,                  // this is an optional test that requires SSH. sig-network
+			`should idle the service and DeploymentConfig properly`,                      // idling with a single service and DeploymentConfig [Conformance]
+			`\[Driver: csi-hostpath`,                                                     // https://bugzilla.redhat.com/show_bug.cgi?id=1711607
 			`should answer endpoint and wildcard queries for the cluster`,                // currently not supported by dns operator https://github.com/openshift/cluster-dns-operator/issues/43
 			`should propagate mounts to the host`,                                        // requires SSH, https://bugzilla.redhat.com/show_bug.cgi?id=1711600
 			`should allow ingress access on one named port`,                              // https://bugzilla.redhat.com/show_bug.cgi?id=1711602
 			`ClusterDns \[Feature:Example\] should create pod that uses dns`,             // https://bugzilla.redhat.com/show_bug.cgi?id=1711601
 			`should be rejected when no endpoints exist`,                                 // https://bugzilla.redhat.com/show_bug.cgi?id=1711605
 			`PreemptionExecutionPath runs ReplicaSets to verify preemption running path`, // https://bugzilla.redhat.com/show_bug.cgi?id=1711606
-			`TaintBasedEvictions`, // https://bugzilla.redhat.com/show_bug.cgi?id=1711608
+			`TaintBasedEvictions`,                                                        // https://bugzilla.redhat.com/show_bug.cgi?id=1711608
+			// TODO(workloads): reenable
+			`SchedulerPreemption`,
 
 			`\[Driver: iscsi\]`, // https://bugzilla.redhat.com/show_bug.cgi?id=1711627
-			`\[Driver: ceph\]\[Feature:Volumes\] \[Testpattern: Pre-provisioned PV \(default fs\)\] subPath should verify container cannot write to subpath`,
 
-			`\[Driver: aws\] \[Testpattern: Dynamic PV \(default fs\)\] provisioning should access volume from different nodes`, // https://bugzilla.redhat.com/show_bug.cgi?id=1711688
 			`\[Driver: nfs\] \[Testpattern: Dynamic PV \(default fs\)\] provisioning should access volume from different nodes`, // https://bugzilla.redhat.com/show_bug.cgi?id=1711688
 
-			`Probing container should \*not\* be restarted with a non-local redirect http liveness probe`, // https://bugzilla.redhat.com/show_bug.cgi?id=1711687
+			// Test fails on platforms that use LoadBalancerService and HostNetwork endpoint publishing strategy
+			`\[Conformance\]\[Area:Networking\]\[Feature:Router\] The HAProxy router should set Forwarded headers appropriately`, // https://bugzilla.redhat.com/show_bug.cgi?id=1752646
 
 			// requires a 1.14 kubelet, enable when rhcos is built for 4.2
 			"when the NodeLease feature is enabled",
 			"RuntimeClass should reject",
+
+			// TODO(node): configure the cri handler for the runtime class to make this work
+			"should run a Pod requesting a RuntimeClass with a configured handler",
+			"should reject a Pod requesting a RuntimeClass with conflicting node selector",
+			"should run a Pod requesting a RuntimeClass with scheduling",
+
+			// TODO(sdn): reenable when openshift/sdn is rebased to 1.16
+			`Services should implement service.kubernetes.io/headless`,
+
+			// TODO(sdn): test pod fails to connect in 1.16
+			`should allow ingress access from updated pod`,
+
+			// TODO(storage): fix the use of SSH into the node
+			`volumeMode should not mount / map unused volumes in a pod`,
+
+			// TODO(workload): reactivate when oc is rebased
+			`should support exec using resource/name`,
+
+			// Disable these tests for now because they require 1.16 kubelet
+			// https://bugzilla.redhat.com/show_bug.cgi?id=1755000
+			`VolumeSubpathEnvExpansion`,
+			`CSI mock volume CSI Volume expansion`,
+			`CSI mock volume CSI online volume expansion`,
+			`CSI mock volume CSI workload information using mock driver`,
+			`volume-expand should resize volume when PVC is edited while pod is using it`,
+		},
+		// tests that may work, but we don't support them
+		"[Disabled:Unsupported]": {
+			`\[Driver: rbd\]`,  // OpenShift 4.x does not support Ceph RBD (use CSI instead)
+			`\[Driver: ceph\]`, // OpenShift 4.x does not support CephFS (use CSI instead)
 		},
 		// tests too slow to be part of conformance
 		"[Slow]": {
@@ -417,6 +482,9 @@ var (
 		"[Flaky]": {
 			`Job should run a job to completion when tasks sometimes fail and are not locally restarted`, // seems flaky, also may require too many resources
 			`openshift mongodb replication creating from a template`,                                     // flaking on deployment
+
+			// TODO(node): test works when run alone, but not in the suite in CI
+			`\[Feature:HPA\] Horizontal pod autoscaling \(scale resource: CPU\) \[sig-autoscaling\] ReplicationController light Should scale from 1 pod to 2 pods`,
 		},
 		// tests that must be run without competition
 		"[Serial]": {
@@ -431,8 +499,69 @@ var (
 			`DynamicProvisioner should test that deleting a claim before the volume is provisioned deletes the volume`, // test is very disruptive to other tests
 
 			`Should be able to support the 1\.7 Sample API Server using the current Aggregator`, // down apiservices break other clients today https://bugzilla.redhat.com/show_bug.cgi?id=1623195
+
+			`\[Feature:HPA\] Horizontal pod autoscaling \(scale resource: CPU\) \[sig-autoscaling\] ReplicationController light Should scale from 1 pod to 2 pods`,
+		},
+		"[Skipped:azure]": {
+			"Networking should provide Internet connection for containers", // Azure does not allow ICMP traffic to internet.
+
+			// openshift-tests cannot access Azure API to create in-line or pre-provisioned volumes, https://bugzilla.redhat.com/show_bug.cgi?id=1723603
+			`\[sig-storage\] In-tree Volumes \[Driver: azure\] \[Testpattern: Inline-volume`,
+			`\[sig-storage\] In-tree Volumes \[Driver: azure\] \[Testpattern: Pre-provisioned PV`,
+		},
+		"[Skipped:gce]": {
+			// Requires creation of a different compute instance in a different zone and is not compatible with volumeBindingMode of WaitForFirstConsumer which we use in 4.x
+			`\[sig-scheduling\] Multi-AZ Cluster Volumes \[sig-storage\] should only be allowed to provision PDs in zones where nodes exist`,
+
+			// The following tests try to ssh directly to a node. None of our nodes have external IPs
+			`\[k8s.io\] \[sig-node\] crictl should be able to run crictl on the node`,
+			`\[sig-storage\] Flexvolumes should be mountable`,
+			`\[sig-storage\] Detaching volumes should not work when mount is in progress`,
+
+			// We are using openshift-sdn to conceal metadata
+			`\[sig-auth\] Metadata Concealment should run a check-metadata-concealment job to completion`,
+
+			// https://bugzilla.redhat.com/show_bug.cgi?id=1740959
+			`\[sig-api-machinery\] AdmissionWebhook Should be able to deny pod and configmap creation`,
+
+			// https://bugzilla.redhat.com/show_bug.cgi?id=1745720
+			`\[sig-storage\] CSI Volumes \[Driver: pd.csi.storage.gke.io\]\[Serial\]`,
+
+			// https://bugzilla.redhat.com/show_bug.cgi?id=1749882
+			`\[sig-storage\] CSI Volumes CSI Topology test using GCE PD driver \[Serial\]`,
+
+			// https://bugzilla.redhat.com/show_bug.cgi?id=1751367
+			`gce-localssd-scsi-fs`,
+
+			// https://bugzilla.redhat.com/show_bug.cgi?id=1750851
+			// should be serial if/when it's re-enabled
+			`\[HPA\] Horizontal pod autoscaling \(scale resource: Custom Metrics from Stackdriver\)`,
+		},
+		// tests that don't pass under openshift-sdn but that are expected to pass
+		// with other network plugins (particularly ovn-kubernetes)
+		"[Skipped:Network/OpenShiftSDN]": {
+			`NetworkPolicy between server and client should allow egress access on one named port`, // not yet implemented
+		},
+		// tests that don't pass under openshift-sdn multitenant mode
+		"[Skipped:Network/OpenShiftSDN/Multitenant]": {
+			`\[Feature:NetworkPolicy\]`, // not compatible with multitenant mode
+			`\[sig-network\] Services should preserve source pod IP for traffic thru service cluster IP`, // known bug, not planned to be fixed
+		},
+		// tests that don't pass under OVN Kubernetes
+		"[Skipped:Network/OVNKubernetes]": {
+			`\[sig-network\] Services should be able to switch session affinity for NodePort service`,            // https://jira.coreos.com/browse/SDN-510
+			`\[sig-network\] Services should be able to switch session affinity for service with type clusterIP`, // https://jira.coreos.com/browse/SDN-510
+			`\[sig-network\] Services should have session affinity work for NodePort service`,                    // https://jira.coreos.com/browse/SDN-510
+			`\[sig-network\] Services should have session affinity work for service with type clusterIP`,         // https://jira.coreos.com/browse/SDN-510
 		},
 		"[Suite:openshift/scalability]": {},
+		// tests that replace the old test-cmd script
+		"[Suite:openshift/test-cmd]": {
+			`\[Suite:openshift/test-cmd\]`,
+		},
+		"[Suite:openshift/csi]": {
+			`External Storage \[Driver:`,
+		},
 	}
 
 	// labelExcludes temporarily block tests out of a specific suite
@@ -445,9 +574,8 @@ var (
 		`\[Slow\]`,
 		`\[Flaky\]`,
 		`\[local\]`,
-		`\[Local\]`,
+		`\[Suite:openshift/test-cmd\]`,
 	}
-	excludedTestsFilter = regexp.MustCompile(strings.Join(excludedTests, `|`))
 )
 
 // checkSyntheticInput selects tests based on synthetic skips or focuses
@@ -482,7 +610,7 @@ func allowAllNodeScheduling(c kclientset.Interface, namespace string) {
 		if ns.Annotations == nil {
 			ns.Annotations = make(map[string]string)
 		}
-		ns.Annotations["openshift.io/node-selector"] = ""
+		ns.Annotations[projectv1.ProjectNodeSelector] = ""
 		_, err = c.CoreV1().Namespaces().Update(ns)
 		return err
 	})
@@ -491,11 +619,11 @@ func allowAllNodeScheduling(c kclientset.Interface, namespace string) {
 	}
 }
 
-func addE2EServiceAccountsToSCC(securityClient securityclient.Interface, namespaces []kapiv1.Namespace, sccName string) {
+func addE2EServiceAccountsToSCC(securityClient securityv1client.Interface, namespaces []kapiv1.Namespace, sccName string) {
 	// Because updates can race, we need to set the backoff retries to be > than the number of possible
 	// parallel jobs starting at once. Set very high to allow future high parallelism.
 	err := retry.RetryOnConflict(longRetry, func() error {
-		scc, err := securityClient.Security().SecurityContextConstraints().Get(sccName, metav1.GetOptions{})
+		scc, err := securityClient.SecurityV1().SecurityContextConstraints().Get(sccName, metav1.GetOptions{})
 		if err != nil {
 			if apierrs.IsNotFound(err) {
 				return nil
@@ -508,7 +636,7 @@ func addE2EServiceAccountsToSCC(securityClient securityclient.Interface, namespa
 				scc.Groups = append(scc.Groups, fmt.Sprintf("system:serviceaccounts:%s", ns.Name))
 			}
 		}
-		if _, err := securityClient.Security().SecurityContextConstraints().Update(scc); err != nil {
+		if _, err := securityClient.SecurityV1().SecurityContextConstraints().Update(scc); err != nil {
 			return err
 		}
 		return nil
@@ -537,17 +665,17 @@ func addRoleToE2EServiceAccounts(rbacClient rbacv1client.RbacV1Interface, namesp
 	err := retry.RetryOnConflict(longRetry, func() error {
 		for _, ns := range namespaces {
 			if isE2ENamespace(ns.Name) && ns.Status.Phase != kapiv1.NamespaceTerminating {
-				sa := fmt.Sprintf("system:serviceaccount:%s:default", ns.Name)
-				addRole := &policy.RoleModificationOptions{
-					RoleBindingNamespace: ns.Name,
-					RoleKind:             "ClusterRole",
-					RoleName:             roleName,
-					RbacClient:           rbacClient,
-					Users:                []string{sa},
-					PrintFlags:           genericclioptions.NewPrintFlags(""),
-					ToPrinter:            func(string) (printers.ResourcePrinter, error) { return printers.NewDiscardingPrinter(), nil },
-				}
-				if err := addRole.AddRole(); err != nil {
+				_, err := rbacClient.RoleBindings(ns.Name).Create(&rbacv1.RoleBinding{
+					ObjectMeta: metav1.ObjectMeta{GenerateName: "default-" + roleName, Namespace: ns.Name},
+					RoleRef: rbacv1.RoleRef{
+						Kind: "ClusterRole",
+						Name: roleName,
+					},
+					Subjects: []rbacv1.Subject{
+						{Name: "default", Namespace: ns.Name, Kind: rbacv1.ServiceAccountKind},
+					},
+				})
+				if err != nil {
 					e2e.Logf("Warning: Failed to add role to e2e service account: %v", err)
 				}
 			}

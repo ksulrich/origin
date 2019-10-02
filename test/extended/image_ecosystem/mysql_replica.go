@@ -10,7 +10,6 @@ import (
 	"github.com/openshift/api/template"
 	exutil "github.com/openshift/origin/test/extended/util"
 	"github.com/openshift/origin/test/extended/util/db"
-	testutil "github.com/openshift/origin/test/util"
 
 	//	kapiv1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -72,7 +71,7 @@ func replicationTestFactory(oc *exutil.CLI, tc testCase, cleanup func()) func() 
 		// up prior to the AfterEach processing, to guaranteed deletion order
 		defer cleanup()
 
-		err := testutil.WaitForPolicyUpdate(oc.KubeClient().AuthorizationV1(), oc.Namespace(), "create", template.Resource("templates"), true)
+		err := WaitForPolicyUpdate(oc.KubeClient().AuthorizationV1(), oc.Namespace(), "create", template.Resource("templates"), true)
 		o.Expect(err).NotTo(o.HaveOccurred())
 
 		exutil.WaitForOpenShiftNamespaceImageStreams(oc)
@@ -92,7 +91,7 @@ func replicationTestFactory(oc *exutil.CLI, tc testCase, cleanup func()) func() 
 		o.Expect(err).NotTo(o.HaveOccurred())
 
 		g.By("waiting for an endpoint")
-		err = e2e.WaitForEndpoint(oc.KubeFramework().ClientSet, oc.Namespace(), helperName)
+		err = exutil.WaitForEndpoint(oc.KubeFramework().ClientSet, oc.Namespace(), helperName)
 		o.Expect(err).NotTo(o.HaveOccurred())
 
 		tableCounter := 0
@@ -107,7 +106,7 @@ func replicationTestFactory(oc *exutil.CLI, tc testCase, cleanup func()) func() 
 
 			// Test if we can query as root
 			g.By("wait for mysql-master endpoint")
-			err = e2e.WaitForEndpoint(oc.KubeFramework().ClientSet, oc.Namespace(), "mysql-master")
+			err = exutil.WaitForEndpoint(oc.KubeFramework().ClientSet, oc.Namespace(), "mysql-master")
 			o.Expect(err).NotTo(o.HaveOccurred())
 			err := helper.TestRemoteLogin(oc, "mysql-master")
 			o.Expect(err).NotTo(o.HaveOccurred())

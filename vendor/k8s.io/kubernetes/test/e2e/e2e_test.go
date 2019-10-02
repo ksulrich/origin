@@ -17,9 +17,12 @@ limitations under the License.
 package e2e
 
 import (
+	"flag"
 	"fmt"
+	"math/rand"
 	"os"
 	"testing"
+	"time"
 
 	// Never, ever remove the line with "/ginkgo". Without it,
 	// the ginkgo test runner will not detect that this
@@ -29,6 +32,7 @@ import (
 
 	"k8s.io/kubernetes/test/e2e/framework"
 	"k8s.io/kubernetes/test/e2e/framework/testfiles"
+	"k8s.io/kubernetes/test/e2e/framework/viperconfig"
 	"k8s.io/kubernetes/test/e2e/generated"
 	"k8s.io/kubernetes/test/utils/image"
 
@@ -54,8 +58,19 @@ import (
 	_ "k8s.io/kubernetes/test/e2e/windows"
 )
 
+var viperConfig = flag.String("viper-config", "", "The name of a viper config file (https://github.com/spf13/viper#what-is-viper). All e2e command line parameters can also be configured in such a file. May contain a path and may or may not contain the file suffix. The default is to look for an optional file with `e2e` as base name. If a file is specified explicitly, it must be present.")
+
 func init() {
-	framework.ViperizeFlags()
+	// Register test flags, then parse flags.
+	HandleFlags()
+
+	// Now that we know which Viper config (if any) was chosen,
+	// parse it and update those options which weren't already set via command line flags
+	// (which have higher priority).
+	if err := viperconfig.ViperizeFlags(*viperConfig, "e2e", flag.CommandLine); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 
 	if framework.TestContext.ListImages {
 		for _, v := range image.GetImageConfigs() {
@@ -63,6 +78,8 @@ func init() {
 		}
 		os.Exit(0)
 	}
+
+	framework.AfterReadingAllFlags(&framework.TestContext)
 
 	// TODO: Deprecating repo-root over time... instead just use gobindata_util.go , see #23987.
 	// Right now it is still needed, for example by
@@ -79,6 +96,11 @@ func init() {
 		AssetNames: generated.AssetNames,
 	})
 
+}
+
+func TestMain(m *testing.M) {
+	rand.Seed(time.Now().UnixNano())
+	os.Exit(m.Run())
 }
 
 func TestE2E(t *testing.T) {

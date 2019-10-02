@@ -26,11 +26,10 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/util/retry"
 
+	"github.com/openshift/api/image/docker10"
+	imagev1typedclient "github.com/openshift/client-go/image/clientset/versioned/typed/image/v1"
 	"github.com/openshift/library-go/pkg/image/imageutil"
-	imageapi "github.com/openshift/origin/pkg/image/apis/image"
-	imagetypedclientset "github.com/openshift/origin/pkg/image/generated/internalclientset/typed/image/internalversion"
 	exutil "github.com/openshift/origin/test/extended/util"
-	testutil "github.com/openshift/origin/test/util"
 )
 
 const (
@@ -142,14 +141,18 @@ var (
 
 // GetImageLabels retrieves Docker labels from image from image repository name and
 // image reference
-func GetImageLabels(c imagetypedclientset.ImageStreamImageInterface, imageRepoName, imageRef string) (map[string]string, error) {
-	_, imageID, err := imageapi.ParseImageStreamImageName(imageRef)
+func GetImageLabels(c imagev1typedclient.ImageStreamImageInterface, imageRepoName, imageRef string) (map[string]string, error) {
+	_, imageID, err := imageutil.ParseImageStreamImageName(imageRef)
 	image, err := c.Get(imageutil.JoinImageStreamImage(imageRepoName, imageID), metav1.GetOptions{})
 
 	if err != nil {
 		return map[string]string{}, err
 	}
-	return image.Image.DockerImageMetadata.Config.Labels, nil
+	if err := imageutil.ImageWithMetadata(&image.Image); err != nil {
+		return nil, err
+	}
+
+	return image.Image.DockerImageMetadata.Object.(*docker10.DockerImage).Config.Labels, nil
 }
 
 // BuildAndPushImageOfSizeWithBuilder tries to build an image of wanted size and number of layers. Built image
@@ -465,7 +468,7 @@ func getDockerVersion(logger io.Writer) (major, minor int, version string, err e
 	reVersion := regexp.MustCompile(`^(\d+)\.(\d+)`)
 
 	if dockerVersion == "" {
-		client, err2 := testutil.NewDockerClient()
+		client, err2 := dockerclient.NewClientFromEnv()
 		if err = err2; err != nil {
 			return
 		}
@@ -729,7 +732,7 @@ func AssertDeletedStorageFiles(deleted, expected *RegistryStorageFiles) error {
 	return kerrors.NewAggregate(errors)
 }
 
-// CleanUpContainer holds names of image names, docker image IDs, imagestreamtags and imagestreams that shall
+// CleanUpContainer holds names of image names, container image IDs, imagestreamtags and imagestreams that shall
 // be deleted at the end of the test.
 type CleanUpContainer struct {
 	OC *exutil.CLI
@@ -751,7 +754,7 @@ func NewCleanUpContainer(oc *exutil.CLI) *CleanUpContainer {
 	}
 }
 
-// AddImage marks given image name, docker image id and imagestreamtag as candidates for deletion.
+// AddImage marks given image name, container image id and imagestreamtag as candidates for deletion.
 func (c *CleanUpContainer) AddImage(name, id, isTag string) {
 	if len(name) > 0 {
 		c.imageNames.Insert(name)
@@ -772,19 +775,19 @@ func (c *CleanUpContainer) AddImageStream(isName string) {
 // Run deletes all the marked objects.
 func (c *CleanUpContainer) Run() {
 	for image := range c.imageNames {
-		err := c.OC.AsAdmin().ImageClient().Image().Images().Delete(image, nil)
+		err := c.OC.AsAdmin().ImageClient().ImageV1().Images().Delete(image, nil)
 		if err != nil {
 			fmt.Fprintf(g.GinkgoWriter, "clean up of image %q failed: %v\n", image, err)
 		}
 	}
 	for isName := range c.isNames {
-		err := c.OC.AsAdmin().ImageClient().Image().ImageStreams(c.OC.Namespace()).Delete(isName, nil)
+		err := c.OC.AsAdmin().ImageClient().ImageV1().ImageStreams(c.OC.Namespace()).Delete(isName, nil)
 		if err != nil {
 			fmt.Fprintf(g.GinkgoWriter, "clean up of image stream %q failed: %v\n", isName, err)
 		}
 	}
 	for isTag := range c.isTags {
-		err := c.OC.ImageClient().Image().ImageStreamTags(c.OC.Namespace()).Delete(isTag, nil)
+		err := c.OC.ImageClient().ImageV1().ImageStreamTags(c.OC.Namespace()).Delete(isTag, nil)
 		if err != nil {
 			fmt.Fprintf(g.GinkgoWriter, "clean up of image stream tag %q failed: %v\n", isTag, err)
 		}
@@ -803,7 +806,7 @@ func (c *CleanUpContainer) Run() {
 		return
 	}
 
-	dClient, err := testutil.NewDockerClient()
+	dClient, err := dockerclient.NewClientFromEnv()
 	if err != nil {
 		fmt.Fprintf(g.GinkgoWriter, "failed to create a new docker client: %v\n", err)
 		return

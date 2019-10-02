@@ -18,13 +18,14 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	e2e "k8s.io/kubernetes/test/e2e/framework"
+	"k8s.io/kubernetes/test/e2e/framework/pod"
 
-	buildutil "github.com/openshift/origin/pkg/build/util"
+	buildv1 "github.com/openshift/api/build/v1"
 	exutil "github.com/openshift/origin/test/extended/util"
 	"github.com/openshift/origin/test/extended/util/jenkins"
 )
 
-var _ = g.Describe("[Slow]jenkins repos e2e openshift using slow samples pipeline build", func() {
+var _ = g.Describe("[Feature:Jenkins][Slow]jenkins repos e2e openshift using slow openshift pipeline build", func() {
 	defer g.GinkgoRecover()
 
 	var (
@@ -32,7 +33,6 @@ var _ = g.Describe("[Slow]jenkins repos e2e openshift using slow samples pipelin
 		jenkinsPersistentTemplatePath = exutil.FixturePath("..", "..", "examples", "jenkins", "jenkins-persistent-template.json")
 		nodejsDeclarativePipelinePath = exutil.FixturePath("..", "..", "examples", "jenkins", "pipeline", "nodejs-sample-pipeline.yaml")
 		mavenSlavePipelinePath        = exutil.FixturePath("..", "..", "examples", "jenkins", "pipeline", "maven-pipeline.yaml")
-		mavenSlaveGradlePipelinePath  = exutil.FixturePath("testdata", "builds", "gradle-pipeline.yaml")
 		blueGreenPipelinePath         = exutil.FixturePath("..", "..", "examples", "jenkins", "pipeline", "bluegreen-pipeline.yaml")
 		envVarsPipelinePath           = exutil.FixturePath("testdata", "samplepipeline-withenvs.yaml")
 		oc                            = exutil.NewCLI("jenkins-pipeline", exutil.KubeConfigPath())
@@ -66,14 +66,14 @@ var _ = g.Describe("[Slow]jenkins repos e2e openshift using slow samples pipelin
 					e2e.DeletePersistentVolume(client, pv.Name)
 				}
 				g.By("removing nfs pod")
-				e2e.DeletePodWithWait(oc.AsAdmin().KubeFramework(), client, nfspod)
+				pod.DeletePodWithWait(client, nfspod)
 			}
 		}
 		setupJenkins = func(jenkinsTemplatePath string) {
 			exutil.PreTestDump()
 			// Deploy Jenkins
 			// NOTE, we use these tests for both a) nightly regression runs against the latest openshift jenkins image on docker hub, and
-			// b) PR testing for changes to the various openshift jenkins plugins we support.  With scenario b), a docker image that extends
+			// b) PR testing for changes to the various openshift jenkins plugins we support.  With scenario b), a container image that extends
 			// our jenkins image is built, where the proposed plugin change is injected, overwritting the current released version of the plugin.
 			// Our test/PR jobs on ci.openshift create those images, as well as set env vars this test suite looks for.  When both the env var
 			// and test image is present, a new image stream is created using the test image, and our jenkins template is instantiated with
@@ -239,7 +239,7 @@ var _ = g.Describe("[Slow]jenkins repos e2e openshift using slow samples pipelin
 				build, err := oc.BuildClient().BuildV1().Builds(oc.Namespace()).Get(fmt.Sprintf("sample-pipeline-withenvs-%d", i), metav1.GetOptions{})
 				o.Expect(err).NotTo(o.HaveOccurred())
 
-				jenkinsBuildURI, err := url.Parse(build.Annotations[buildutil.BuildJenkinsBuildURIAnnotation])
+				jenkinsBuildURI, err := url.Parse(build.Annotations[buildv1.BuildJenkinsBuildURIAnnotation])
 
 				if err != nil {
 					fmt.Fprintf(g.GinkgoWriter, "error parsing build uri: %s", err)
@@ -363,26 +363,6 @@ var _ = g.Describe("[Slow]jenkins repos e2e openshift using slow samples pipelin
 				o.Expect(err).NotTo(o.HaveOccurred())
 			})
 
-			g.By("should build a gradle project and complete successfully", func() {
-				err := oc.Run("create").Args("-f", mavenSlaveGradlePipelinePath).Execute()
-				o.Expect(err).NotTo(o.HaveOccurred())
-
-				// start the build
-				g.By("waiting for the build to complete")
-				br := &exutil.BuildResult{Oc: oc, BuildName: "gradle-1"}
-				err = exutil.WaitForBuildResult(oc.BuildClient().BuildV1().Builds(oc.Namespace()), br)
-				if err != nil || !br.BuildSuccess {
-					exutil.DumpBuilds(oc)
-					exutil.DumpPodLogsStartingWith("maven", oc)
-				}
-				debugAnyJenkinsFailure(br, oc.Namespace()+"-gradle-pipeline", oc, true)
-				br.AssertSuccess()
-
-				g.By("clean up openshift resources for next potential run")
-				err = oc.Run("delete").Args("bc", "gradle").Execute()
-				o.Expect(err).NotTo(o.HaveOccurred())
-			})
-
 			g.By("Pipelines with declarative syntax")
 
 			g.By("should build successfully", func() {
@@ -485,7 +465,7 @@ var _ = g.Describe("[Slow]jenkins repos e2e openshift using slow samples pipelin
 								errs <- fmt.Errorf("error getting build: %s", err)
 								return
 							}
-							jenkinsBuildURI = build.Annotations[buildutil.BuildJenkinsBuildURIAnnotation]
+							jenkinsBuildURI = build.Annotations[buildv1.BuildJenkinsBuildURIAnnotation]
 							if jenkinsBuildURI != "" {
 								break
 							}
@@ -611,7 +591,7 @@ var _ = g.Describe("[Slow]jenkins repos e2e openshift using slow samples pipelin
 					build, err := oc.BuildClient().BuildV1().Builds(oc.Namespace()).Get(fmt.Sprintf("sample-pipeline-withenvs-%d", i), metav1.GetOptions{})
 					o.Expect(err).NotTo(o.HaveOccurred())
 
-					jenkinsBuildURI, err := url.Parse(build.Annotations[buildutil.BuildJenkinsBuildURIAnnotation])
+					jenkinsBuildURI, err := url.Parse(build.Annotations[buildv1.BuildJenkinsBuildURIAnnotation])
 					if err != nil {
 						fmt.Fprintf(g.GinkgoWriter, "error parsing build uri: %s", err)
 					}

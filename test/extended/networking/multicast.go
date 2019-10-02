@@ -7,26 +7,28 @@ import (
 
 	networkapi "github.com/openshift/api/network/v1"
 	networkclient "github.com/openshift/client-go/network/clientset/versioned/typed/network/v1"
-	"github.com/openshift/origin/pkg/network"
+	"github.com/openshift/library-go/pkg/network/networkutils"
 	testexutil "github.com/openshift/origin/test/extended/util"
-	testutil "github.com/openshift/origin/test/util"
 
 	kapiv1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	e2e "k8s.io/kubernetes/test/e2e/framework"
+	frameworkpod "k8s.io/kubernetes/test/e2e/framework/pod"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
 )
 
 var _ = Describe("[Area:Networking] multicast", func() {
+	oc := testexutil.NewCLI("multicast", testexutil.KubeConfigPath())
+
 	// The subnet plugin should block all multicast. The multitenant and networkpolicy
 	// plugins should implement multicast in the way that we test. For third-party
 	// plugins, the behavior is unspecified and we should not run either test.
 
-	InPluginContext([]string{network.SingleTenantPluginName},
+	InPluginContext([]string{networkutils.SingleTenantPluginName},
 		func() {
 			oc := testexutil.NewCLI("multicast", testexutil.KubeConfigPath())
 			f := oc.KubeFramework()
@@ -37,27 +39,26 @@ var _ = Describe("[Area:Networking] multicast", func() {
 		},
 	)
 
-	InPluginContext([]string{network.MultiTenantPluginName, network.NetworkPolicyPluginName},
+	InPluginContext([]string{networkutils.MultiTenantPluginName, networkutils.NetworkPolicyPluginName},
 		func() {
-			oc := testexutil.NewCLI("multicast", testexutil.KubeConfigPath())
 			f := oc.KubeFramework()
 
 			It("should block multicast traffic in namespaces where it is disabled", func() {
 				Expect(testMulticast(f, oc)).NotTo(Succeed())
 			})
 			It("should allow multicast traffic in namespaces where it is enabled", func() {
-				makeNamespaceMulticastEnabled(f.Namespace)
+				makeNamespaceMulticastEnabled(oc, f.Namespace)
 				Expect(testMulticast(f, oc)).To(Succeed())
 			})
 		},
 	)
 })
 
-func makeNamespaceMulticastEnabled(ns *kapiv1.Namespace) {
-	clientConfig, err := testutil.GetClusterAdminClientConfig(testexutil.KubeConfigPath())
+func makeNamespaceMulticastEnabled(oc *testexutil.CLI, ns *kapiv1.Namespace) {
+	clientConfig := oc.AdminConfig()
 	networkClient := networkclient.NewForConfigOrDie(clientConfig)
-	expectNoError(err)
 	var netns *networkapi.NetNamespace
+	var err error
 	err = wait.Poll(time.Second, 2*time.Minute, func() (bool, error) {
 		netns, err = networkClient.NetNamespaces().Get(ns.Name, metav1.GetOptions{})
 		if err != nil {
@@ -175,7 +176,7 @@ func launchTestMulticastPod(f *e2e.Framework, nodeName string, podName string) (
 	})
 
 	if err != nil {
-		logs, logErr := e2e.GetPodLogs(f.ClientSet, f.Namespace.Name, podName, fmt.Sprintf("%s-pod", podName))
+		logs, logErr := frameworkpod.GetPodLogs(f.ClientSet, f.Namespace.Name, podName, fmt.Sprintf("%s-pod", podName))
 		if logErr != nil {
 			e2e.Failf("Error getting container logs: %s", logErr)
 		}

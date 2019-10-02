@@ -17,7 +17,7 @@ import (
 var _ = g.Describe("[Conformance][Area:Networking][Feature:Router]", func() {
 	defer g.GinkgoRecover()
 	var (
-		configPath = exutil.FixturePath("testdata", "reencrypt-serving-cert.yaml")
+		configPath = exutil.FixturePath("testdata", "router", "reencrypt-serving-cert.yaml")
 		oc         *exutil.CLI
 
 		ip, ns string
@@ -57,7 +57,7 @@ var _ = g.Describe("[Conformance][Area:Networking][Feature:Router]", func() {
 
 			var hostname string
 			err = wait.Poll(time.Second, changeTimeoutSeconds*time.Second, func() (bool, error) {
-				route, err := oc.RouteClient().Route().Routes(ns).Get("serving-cert", metav1.GetOptions{})
+				route, err := oc.RouteClient().RouteV1().Routes(ns).Get("serving-cert", metav1.GetOptions{})
 				if err != nil {
 					return false, err
 				}

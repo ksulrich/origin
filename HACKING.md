@@ -8,7 +8,7 @@ system with Docker, which will create a build environment image and then
 execute a cross-platform Go build within it. The build output will be copied
 to `_output/releases` as a set of tars containing each version. It will also
 build the `openshift/origin-base` image which is the common parent image for all
-OpenShift Docker images.
+OpenShift container images.
 
     $ make release
 
@@ -45,9 +45,9 @@ use:
 
     $ hack/env ${COMMAND}
 
-For instance, to build the `oc` binary:
+For instance, to build the `openshift-tests` binary:
 
-    $ hack/env make build WHAT=cmd/oc
+    $ hack/env make build WHAT=cmd/openshift-tests
 
 The release container works by streaming a copy of the repository into a volume,
 sharing that volume with the container as its working directory, executing the
@@ -68,7 +68,7 @@ for a full release of OpenShift, it is also possible to build individual
 binaries. Binary entry points are kept under the `cmd/` directory and can be
 specified to build with the `WHAT` parameter, for instance, to build just `oc`:
 
-    $ make build WHAT=cmd/oc
+    $ make build WHAT=cmd/openshift-tests
 
 ### Building Individual Images
 
@@ -200,7 +200,7 @@ costly setup those components should be tested in isolation.
 
 We break integration tests into two categories, those that use Docker and those
 that do not.  In general, high-level components that depend on the behavior of code
-running inside a Docker container should have at least one or two integration tests
+running inside a container should have at least one or two integration tests
 that test all the way down to Docker, but those should be part of their own
 test suite.  Testing the API and high-level API functions should generally
 not depend on calling into Docker. They are denoted by special test tags and
@@ -265,7 +265,7 @@ components working together.
 All e2e tests are compiled into the `openshift-tests` binary.
 To build the test binary, run `make build-extended-test`.
 
-To run a specific test, or an entire suite of tests, read 
+To run a specific test, or an entire suite of tests, read
 [test/extended/README](https://github.com/openshift/origin/blob/master/test/extended/README.md)
 for more information.
 
@@ -701,7 +701,7 @@ On OS X, you can obtain header files via Homebrew:
 
 Once dependencies are in place, build with the `gssapi` tag:
 
-    $ hack/build-go.sh cmd/oc -tags=gssapi
+    $ hack/build-go.sh vendor/github.com/openshift/oc/cmd/oc -tags=gssapi
 
 Verify that the GSSAPI feature is enabled with `oc version`:
 

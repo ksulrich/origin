@@ -17,6 +17,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	kclientset "k8s.io/client-go/kubernetes"
 	"k8s.io/kubernetes/test/e2e/framework"
+	frameworkpod "k8s.io/kubernetes/test/e2e/framework/pod"
 
 	exutil "github.com/openshift/origin/test/extended/util"
 )
@@ -128,7 +129,7 @@ func (pod *testPod) syncState(c kclientset.Interface, ns string, timeout time.Du
 
 	err = wait.Poll(2*time.Second, timeout,
 		func() (bool, error) {
-			podList, err := framework.WaitForPodsWithLabel(c, ns, label)
+			podList, err := frameworkpod.WaitForPodsWithLabel(c, ns, label)
 			if err != nil {
 				framework.Logf("Failed getting pods: %v", err)
 				return false, nil // Ignore this error (nil) and try again in "Poll" time
@@ -255,7 +256,7 @@ RUN echo %s > /3
 	o.Expect(err).NotTo(o.HaveOccurred())
 
 	g.By(fmt.Sprintf("checking for the imported tag: %s", istName))
-	ist, err := oc.ImageClient().Image().ImageStreamTags(oc.Namespace()).Get(istName, metav1.GetOptions{})
+	ist, err := oc.ImageClient().ImageV1().ImageStreamTags(oc.Namespace()).Get(istName, metav1.GetOptions{})
 	o.Expect(err).NotTo(o.HaveOccurred())
 
 	return isName, ist.Image.Name

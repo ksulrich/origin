@@ -19,7 +19,6 @@ package proxy
 import (
 	"bufio"
 	"bytes"
-	"context"
 	"fmt"
 	"io"
 	"io/ioutil"
@@ -220,8 +219,8 @@ func (h *UpgradeAwareHandler) ServeHTTP(w http.ResponseWriter, req *http.Request
 		h.Transport = h.defaultProxyTransport(req.URL, h.Transport)
 	}
 
-	// WithContext creates a shallow clone of the request with the new context.
-	newReq := req.WithContext(context.Background())
+	// WithContext creates a shallow clone of the request with the same context.
+	newReq := req.WithContext(req.Context())
 	newReq.Header = utilnet.CloneHeader(req.Header)
 	if !h.UseRequestLocation {
 		newReq.URL = &loc
@@ -230,6 +229,10 @@ func (h *UpgradeAwareHandler) ServeHTTP(w http.ResponseWriter, req *http.Request
 	proxy := httputil.NewSingleHostReverseProxy(&url.URL{Scheme: h.Location.Scheme, Host: h.Location.Host})
 	proxy.Transport = h.Transport
 	proxy.FlushInterval = h.FlushInterval
+
+	defer func() {
+		recover() // ignore panics inside of the reverse proxy on unclean disconnects
+	}()
 	proxy.ServeHTTP(w, newReq)
 }
 

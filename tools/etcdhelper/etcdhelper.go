@@ -11,20 +11,17 @@ import (
 	"time"
 
 	jsonserializer "k8s.io/apimachinery/pkg/runtime/serializer/json"
-	"k8s.io/kubernetes/pkg/kubectl/scheme"
+	"k8s.io/kubectl/pkg/scheme"
 
 	"github.com/coreos/etcd/clientv3"
 	"github.com/coreos/etcd/pkg/transport"
 
-	// install all APIs
-	install "github.com/openshift/origin/pkg/api/install"
-	"github.com/openshift/origin/pkg/api/legacy"
+	"github.com/openshift/api"
 )
 
 func init() {
-	install.InstallInternalOpenShift(scheme.Scheme)
-	install.InstallInternalKube(scheme.Scheme)
-	legacy.InstallInternalLegacyAll(scheme.Scheme)
+	api.Install(scheme.Scheme)
+	api.InstallKube(scheme.Scheme)
 }
 
 func main() {

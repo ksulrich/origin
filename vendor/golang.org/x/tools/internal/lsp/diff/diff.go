@@ -13,9 +13,9 @@ import "strings"
 
 type Op struct {
 	Kind    OpKind
-	Content string
-	I1, I2  int // indices of the line in a
-	J1, J2  int // indices of the line in b
+	Content []string // content from b
+	I1, I2  int      // indices of the line in a
+	J1      int      // indices of the line in b, J2 implied by len(Content)
 }
 
 type OpKind int
@@ -51,7 +51,7 @@ func ApplyEdits(a []string, operations []*Op) []string {
 		}
 		switch op.Kind {
 		case Equal, Insert:
-			b = append(b, op.Content)
+			b = append(b, op.Content...)
 		}
 		prevI2 = op.I2
 	}
@@ -70,6 +70,8 @@ func Operations(a, b []string) []*Op {
 	trace, offset := shortestEditSequence(a, b)
 	snakes := backtrack(trace, len(a), len(b), offset)
 
+	M, N := len(a), len(b)
+
 	var i int
 	solution := make([]*Op, len(a)+len(b))
 
@@ -78,9 +80,8 @@ func Operations(a, b []string) []*Op {
 			return
 		}
 		op.I2 = i2
-		op.J2 = j2
 		if op.Kind == Insert {
-			op.Content = strings.Join(b[op.J1:op.J2], "")
+			op.Content = b[op.J1:j2]
 		}
 		solution[i] = op
 		i++
@@ -101,7 +102,7 @@ func Operations(a, b []string) []*Op {
 				}
 			}
 			x++
-			if x == len(a) {
+			if x == M {
 				break
 			}
 		}
@@ -125,58 +126,7 @@ func Operations(a, b []string) []*Op {
 			x++
 			y++
 		}
-		if x >= len(a) && y >= len(b) {
-			break
-		}
-	}
-	return solution[:i]
-}
-
-// Lines returns a list of per-line operations to convert a into b.
-func Lines(a, b []string) []*Op {
-	trace, offset := shortestEditSequence(a, b)
-	snakes := backtrack(trace, len(a), len(b), offset)
-
-	var i int
-	solution := make([]*Op, len(a)+len(b))
-
-	x, y := 0, 0
-	for _, snake := range snakes {
-		if len(snake) < 2 {
-			continue
-		}
-		// horizontal
-		for snake[0]-snake[1] > x-y {
-			solution[i] = &Op{
-				Kind:    Delete,
-				Content: a[x],
-			}
-			i++
-			x++
-			if x == len(a) {
-				break
-			}
-		}
-		// vertical
-		for snake[0]-snake[1] < x-y {
-			solution[i] = &Op{
-				Kind:    Insert,
-				Content: b[y],
-			}
-			i++
-			y++
-		}
-		// diagonal
-		for x < snake[0] {
-			solution[i] = &Op{
-				Kind:    Equal,
-				Content: a[x],
-			}
-			i++
-			x++
-			y++
-		}
-		if x >= len(a) && y >= len(b) {
+		if x >= M && y >= N {
 			break
 		}
 	}
@@ -208,7 +158,6 @@ func backtrack(trace [][]int, x, y, offset int) [][]int {
 		x = V[kPrev+offset]
 		y = x - kPrev
 	}
-	// this feels questionable
 	if x < 0 || y < 0 {
 		return snakes
 	}
@@ -225,6 +174,7 @@ func shortestEditSequence(a, b []string) ([][]int, int) {
 
 	// Iterate through the maximum possible length of the SES (N+M).
 	for d := 0; d <= N+M; d++ {
+		copyV := make([]int, len(V))
 		// k lines are represented by the equation y = x - k. We move in
 		// increments of 2 because end points for even d are on even k lines.
 		for k := -d; k <= d; k += 2 {
@@ -248,16 +198,27 @@ func shortestEditSequence(a, b []string) ([][]int, int) {
 
 			V[k+offset] = x
 
-			// Save the state of the array.
-			copyV := make([]int, len(V))
-			copy(copyV, V)
-			trace[d] = copyV
-
 			// Return if we've exceeded the maximum values.
-			if x >= M-1 && y >= N-1 {
+			if x == M && y == N {
+				// Save the state of the array, and exit function
+				copy(copyV, V)
+				trace[d] = copyV
+
 				return trace, offset
 			}
 		}
+
+		// Save the state of the array, and continue loop
+		copy(copyV, V)
+		trace[d] = copyV
 	}
 	return nil, 0
+}
+
+func SplitLines(text string) []string {
+	lines := strings.SplitAfter(text, "\n")
+	if lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	return lines
 }
